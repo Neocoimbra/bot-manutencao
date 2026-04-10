@@ -12,6 +12,8 @@ import logging
 import time
 import base64
 import subprocess
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 import urllib.request
 import urllib.parse
@@ -592,5 +594,25 @@ def main():
             logger.error(f"Erro no loop: {e}", exc_info=True)
             time.sleep(5)
 
+# --- Health Check HTTP Server para Render ---
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/plain')
+        self.end_headers()
+        self.wfile.write(b'Bot de Manutencao - Online')
+    def log_message(self, format, *args):
+        pass  # Silencia logs do HTTP server
+
+def start_health_server():
+    port = int(os.environ.get('PORT', 10000))
+    server = HTTPServer(('0.0.0.0', port), HealthHandler)
+    logger.info(f'Health server na porta {port}')
+    server.serve_forever()
+
 if __name__ == "__main__":
+    # Inicia o health server em thread separada
+    health_thread = threading.Thread(target=start_health_server, daemon=True)
+    health_thread.start()
     main()
+
