@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Bot de Manutenção Automotiva e Agrícola - Multi-API com Fallback + Áudio
+Bot de Manutenção Automotiva e Agrícola - WEBHOOK MODE para Render.com
+Multi-API com Fallback + Áudio
 Cascata: Gemini x2 -> DeepSeek -> Claude -> OpenAI -> Fallback
-Transcrição de áudio: Gemini -> DeepSeek -> OpenAI Whisper -> Fallback
 """
 
 import os
@@ -22,6 +22,7 @@ import urllib.error
 # --- Configuração via Variáveis de Ambiente ---
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
+RENDER_URL = os.environ.get("RENDER_EXTERNAL_URL", "")
 
 GEMINI_KEYS = []
 gk1 = os.environ.get("GEMINI_KEY_1", "")
@@ -48,7 +49,7 @@ ADMIN_ID = int(os.environ.get("ADMIN_ID", "912095382"))
 
 FALLBACK_MESSAGE = "Dificuldade em processar todas as solicitações, procure o distribuidor!"
 
-# Cache de APIs com falha - pula APIs que falharam nos últimos 5 minutos
+# Cache de APIs com falha
 _api_fail_cache = {}
 FAIL_CACHE_TTL = 300
 
@@ -215,16 +216,15 @@ def call_claude(prompt):
         return None
 
 def call_ai_with_fallback(prompt):
-    """Cascata com cache: pula APIs que falharam nos últimos 5 min."""
     # 1. Gemini
     for i, key in enumerate(GEMINI_KEYS):
         name = f"gemini_{i+1}"
         if not is_api_available(name):
             continue
-        logger.info(f"Tentando Gemini key {i+1}/{len(GEMINI_KEYS)}...")
+        logger.info(f"Tentando Gemini key {i+1}...")
         res = call_gemini(prompt, key)
         if res:
-            logger.info(f"Gemini key {i+1} respondeu ({len(res)} chars)")
+            logger.info(f"Gemini respondeu ({len(res)} chars)")
             return res
         mark_api_failed(name)
 
@@ -246,7 +246,7 @@ def call_ai_with_fallback(prompt):
             return res
         mark_api_failed("claude")
 
-    # 4. OpenAI (sempre tenta - backup principal)
+    # 4. OpenAI
     if OPENAI_API_KEY:
         logger.info("Tentando OpenAI...")
         res = call_openai_compatible(prompt, OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL, "OpenAI")
@@ -259,9 +259,6 @@ def call_ai_with_fallback(prompt):
 
 # --- Transcrição de Áudio ---
 def transcribe_audio(audio_path):
-    """Tenta transcrever áudio usando múltiplos métodos."""
-    
-    # Converter para WAV
     wav_path = audio_path + ".wav"
     try:
         result = subprocess.run(
@@ -275,62 +272,36 @@ def transcribe_audio(audio_path):
         logger.error(f"ffmpeg exception: {e}")
         return None
 
-    # Método 1: Gemini com áudio (multimodal)
+    # Tenta Gemini multimodal
     for i, key in enumerate(GEMINI_KEYS):
         name = f"gemini_stt_{i+1}"
         if not is_api_available(name):
             continue
-        logger.info(f"Transcrição: tentando Gemini key {i+1}...")
         text = transcribe_with_gemini(wav_path, key)
         if text:
-            logger.info(f"Gemini key {i+1} transcreveu ({len(text)} chars)")
             return text
         mark_api_failed(name)
 
-    # Método 2: DeepSeek STT
-    if is_api_available("deepseek_stt"):
-        logger.info("Transcrição: tentando DeepSeek STT...")
-        text = transcribe_with_openai_whisper(wav_path, DEEPSEEK_API_KEY, "https://api.deepseek.com/v1")
-        if text:
-            logger.info(f"DeepSeek STT transcreveu ({len(text)} chars)")
-            return text
-        mark_api_failed("deepseek_stt")
-
-    # Método 3: OpenAI Whisper (sempre tenta - backup principal)
+    # Tenta OpenAI Whisper
     if OPENAI_API_KEY:
-        logger.info("Transcrição: tentando OpenAI Whisper...")
         text = transcribe_with_openai_whisper(wav_path, OPENAI_API_KEY, OPENAI_BASE_URL)
         if text:
-            logger.info(f"OpenAI Whisper transcreveu ({len(text)} chars)")
             return text
 
-    logger.warning("Todas as transcrições falharam!")
     return None
 
 def transcribe_with_gemini(wav_path, api_key):
-    """Usa Gemini multimodal para transcrever áudio."""
     try:
         with open(wav_path, "rb") as f:
             audio_data = base64.b64encode(f.read()).decode("utf-8")
-        
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={api_key}"
         payload = json.dumps({
-            "contents": [{
-                "parts": [
-                    {
-                        "inline_data": {
-                            "mime_type": "audio/wav",
-                            "data": audio_data
-                        }
-                    },
-                    {
-                        "text": "Transcreva este áudio em português brasileiro. Retorne APENAS o texto transcrito, sem explicações."
-                    }
-                ]
-            }],
+            "contents": [{"parts": [
+                {"inline_data": {"mime_type": "audio/wav", "data": audio_data}},
+                {"text": "Transcreva este áudio em português brasileiro. Retorne APENAS o texto transcrito, sem explicações."}
+            ]}],
             "generationConfig": {"maxOutputTokens": 500, "temperature": 0.1},
         }).encode("utf-8")
-        
         req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
         with urllib.request.urlopen(req, timeout=30) as resp:
             result = json.loads(resp.read().decode("utf-8"))
@@ -338,34 +309,25 @@ def transcribe_with_gemini(wav_path, api_key):
             if candidates:
                 parts = candidates[0].get("content", {}).get("parts", [])
                 if parts:
-                    text = parts[0].get("text", "").strip()
-                    if text:
-                        return text
-        return None
-    except urllib.error.HTTPError as e:
-        logger.warning(f"Gemini STT ...{api_key[-6:]} falhou (HTTP {e.code})")
+                    return parts[0].get("text", "").strip()
         return None
     except Exception as e:
         logger.warning(f"Gemini STT erro: {e}")
         return None
 
 def transcribe_with_openai_whisper(wav_path, api_key, base_url):
-    """Usa OpenAI Whisper API para transcrever."""
     if not api_key:
         return None
     import http.client
-
     host = base_url.replace("https://", "").replace("http://", "")
     if "/" in host:
         path_prefix = "/" + "/".join(host.split("/")[1:])
         host = host.split("/")[0]
     else:
         path_prefix = ""
-
     boundary = "----FormBoundary7MA4YWxk"
     with open(wav_path, "rb") as f:
         file_data = f.read()
-
     body = b""
     body += f"--{boundary}\r\n".encode()
     body += b'Content-Disposition: form-data; name="file"; filename="audio.wav"\r\n'
@@ -379,7 +341,6 @@ def transcribe_with_openai_whisper(wav_path, api_key, base_url):
     body += b'Content-Disposition: form-data; name="language"\r\n\r\n'
     body += b"pt\r\n"
     body += f"--{boundary}--\r\n".encode()
-
     try:
         conn = http.client.HTTPSConnection(host, timeout=30)
         conn.request("POST", f"{path_prefix}/audio/transcriptions", body=body, headers={
@@ -391,7 +352,6 @@ def transcribe_with_openai_whisper(wav_path, api_key, base_url):
         conn.close()
         if resp.status == 200:
             return data.get("text", "")
-        logger.warning(f"Whisper falhou (HTTP {resp.status})")
         return None
     except Exception as e:
         logger.warning(f"Whisper erro: {e}")
@@ -404,8 +364,8 @@ def load_knowledge_base():
         if f.suffix == ".txt":
             try:
                 texts.append(f.read_text(encoding="utf-8", errors="ignore"))
-            except Exception as e:
-                logger.error(f"Erro ao ler {f}: {e}")
+            except:
+                pass
     return "\n\n---\n\n".join(texts) if texts else ""
 
 def build_full_prompt(user_text):
@@ -414,8 +374,6 @@ def build_full_prompt(user_text):
     if knowledge:
         prompt += (
             "\n\n=== INFORMAÇÕES DOS MANUAIS (PRIORIDADE MÁXIMA) ===\n"
-            "Use OBRIGATORIAMENTE estas informações dos manuais como base principal "
-            "para suas respostas. Cite o manual quando usar estas informações:\n\n"
             + knowledge[:4000]
         )
     prompt += f"\n\nPergunta do usuário: {user_text}"
@@ -423,7 +381,6 @@ def build_full_prompt(user_text):
 
 # --- Handlers ---
 def handle_start(chat_id):
-    logger.info(f"Comando /start de {chat_id}")
     send_message(chat_id,
         "🔧 Especialista em Manutenção Online!\n\n"
         "Sou um assistente de IA especializado em manutenção e reparação de "
@@ -438,39 +395,29 @@ def handle_start(chat_id):
     )
 
 def handle_text(chat_id, text):
-    logger.info(f"Mensagem de {chat_id}: {text[:100]}")
+    logger.info(f"Texto de {chat_id}: {text[:80]}")
     send_typing(chat_id)
-    full_prompt = build_full_prompt(text)
-    reply = call_ai_with_fallback(full_prompt)
+    reply = call_ai_with_fallback(build_full_prompt(text))
     send_message(chat_id, reply if reply else FALLBACK_MESSAGE)
 
 def handle_voice(chat_id, voice_or_audio):
-    """Processa mensagem de voz ou áudio."""
     file_id = voice_or_audio.get("file_id")
-    duration = voice_or_audio.get("duration", 0)
-    logger.info(f"Áudio de {chat_id}: {duration}s")
+    logger.info(f"Áudio de {chat_id}")
     send_typing(chat_id)
     send_message(chat_id, "🎤 Processando seu áudio...")
-
     try:
         local_path = download_file(file_id)
         if not local_path:
             send_message(chat_id, "⚠️ Não consegui baixar o áudio.")
             return
-
         transcribed = transcribe_audio(local_path)
         if not transcribed:
             send_message(chat_id, "⚠️ Não consegui transcrever o áudio. Tente enviar como texto.")
             return
-
-        logger.info(f"Transcrição de {chat_id}: {transcribed[:100]}")
         send_message(chat_id, f"🎤 Entendi: \"{transcribed}\"\n\nProcessando resposta...")
         send_typing(chat_id)
-
-        full_prompt = build_full_prompt(transcribed)
-        reply = call_ai_with_fallback(full_prompt)
+        reply = call_ai_with_fallback(build_full_prompt(transcribed))
         send_message(chat_id, reply if reply else FALLBACK_MESSAGE)
-
     except Exception as e:
         logger.error(f"Erro áudio: {e}", exc_info=True)
         send_message(chat_id, "Desculpe, erro ao processar o áudio.")
@@ -479,16 +426,13 @@ def handle_document(chat_id, document):
     if chat_id != ADMIN_ID:
         send_message(chat_id, "⚠️ Apenas o administrador pode enviar documentos para o banco de conhecimento.")
         return
-
     file_name = document.get("file_name", "doc")
     send_message(chat_id, f"📥 Processando manual: {file_name}")
-
     try:
         local_path = download_file(document.get("file_id"))
         if not local_path:
             send_message(chat_id, "❌ Não consegui baixar o arquivo.")
             return
-
         text = ""
         if file_name.lower().endswith(".pdf"):
             from PyPDF2 import PdfReader
@@ -504,31 +448,109 @@ def handle_document(chat_id, document):
         else:
             send_message(chat_id, "⚠️ Formato não suportado. Envie PDF, Word (.docx) ou TXT.")
             return
-
         if text.strip():
             safe_name = "".join(c if c.isalnum() or c in "._-" else "_" for c in file_name)
             save_path = KNOWLEDGE_DIR / f"{safe_name}.txt"
             save_path.write_text(text, encoding="utf-8")
-            send_message(chat_id,
-                f"✅ Manual '{file_name}' indexado com sucesso!\n"
-                f"📊 {len(text)} caracteres adicionados ao banco de conhecimento."
-            )
+            send_message(chat_id, f"✅ Manual '{file_name}' indexado com sucesso!\n📊 {len(text)} caracteres.")
         else:
             send_message(chat_id, "❌ Não foi possível extrair texto do arquivo.")
     except Exception as e:
         logger.error(f"Erro doc: {e}", exc_info=True)
         send_message(chat_id, "❌ Erro técnico ao processar documento.")
 
-# --- Main Loop ---
+# --- Processar Update ---
+def process_update(update):
+    try:
+        msg = update.get("message", {})
+        chat_id = msg.get("chat", {}).get("id")
+        if not chat_id:
+            return
+        text = msg.get("text", "")
+        if text.startswith("/start"):
+            handle_start(chat_id)
+        elif msg.get("voice"):
+            handle_voice(chat_id, msg["voice"])
+        elif msg.get("audio"):
+            handle_voice(chat_id, msg["audio"])
+        elif msg.get("document"):
+            handle_document(chat_id, msg["document"])
+        elif text:
+            handle_text(chat_id, text)
+    except Exception as e:
+        logger.error(f"Erro update: {e}", exc_info=True)
+
+# --- Webhook HTTP Server ---
+class WebhookHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/plain')
+        self.end_headers()
+        self.wfile.write(b'Bot de Manutencao - Online')
+
+    def do_POST(self):
+        try:
+            content_length = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(content_length)
+            update = json.loads(body.decode('utf-8'))
+            logger.info(f"Webhook update {update.get('update_id', '?')}")
+
+            # Responde 200 imediatamente
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/plain')
+            self.end_headers()
+            self.wfile.write(b'OK')
+
+            # Processa em thread separada para não bloquear
+            t = threading.Thread(target=process_update, args=(update,))
+            t.daemon = True
+            t.start()
+        except Exception as e:
+            logger.error(f"Erro webhook: {e}")
+            self.send_response(500)
+            self.end_headers()
+
+    def log_message(self, format, *args):
+        pass  # Silencia logs HTTP padrão
+
+def setup_webhook():
+    if not RENDER_URL:
+        logger.error("RENDER_EXTERNAL_URL não configurado! Adicione esta variável no Render.")
+        return False
+
+    webhook_url = f"{RENDER_URL}/webhook"
+    logger.info(f"Configurando webhook: {webhook_url}")
+
+    # Remove webhook antigo
+    telegram_request("deleteWebhook", {"drop_pending_updates": "false"})
+    time.sleep(1)
+
+    # Configura novo webhook
+    result = telegram_request("setWebhook", {
+        "url": webhook_url,
+        "allowed_updates": json.dumps(["message"]),
+    })
+
+    if result and result.get("ok"):
+        logger.info("Webhook configurado com sucesso!")
+        return True
+    else:
+        logger.error(f"Falha webhook: {result}")
+        return False
+
 def main():
     if not TELEGRAM_TOKEN:
         logger.error("TELEGRAM_TOKEN não configurado!")
         sys.exit(1)
 
     logger.info("=" * 50)
-    logger.info("BOT MANUTENÇÃO - MULTI-API + ÁUDIO")
-    logger.info(f"Cascata IA: Gemini x{len(GEMINI_KEYS)} -> DeepSeek -> Claude -> OpenAI")
+    logger.info("BOT MANUTENÇÃO - WEBHOOK MODE")
+    logger.info(f"Render URL: {RENDER_URL}")
     logger.info(f"Admin ID: {ADMIN_ID}")
+    logger.info(f"Gemini keys: {len(GEMINI_KEYS)}")
+    logger.info(f"DeepSeek: {'sim' if DEEPSEEK_API_KEY else 'não'}")
+    logger.info(f"Claude: {'sim' if CLAUDE_API_KEY else 'não'}")
+    logger.info(f"OpenAI: {'sim' if OPENAI_API_KEY else 'não'}")
     logger.info("=" * 50)
 
     me = telegram_request("getMe")
@@ -537,82 +559,18 @@ def main():
         sys.exit(1)
     logger.info(f"Bot: @{me['result']['username']}")
 
-    telegram_request("deleteWebhook", {"drop_pending_updates": "false"})
-    logger.info("Webhook removido. Iniciando polling...")
+    if not setup_webhook():
+        logger.error("Falha ao configurar webhook! Verifique RENDER_EXTERNAL_URL.")
+        sys.exit(1)
 
-    offset = 0
-    consecutive_errors = 0
-
-    while True:
-        try:
-            result = telegram_request("getUpdates", {
-                "offset": offset,
-                "timeout": 30,
-                "allowed_updates": json.dumps(["message"]),
-            }, timeout=60)
-
-            if result and result.get("ok"):
-                consecutive_errors = 0
-                updates = result.get("result", [])
-                if updates:
-                    logger.info(f"Recebidos {len(updates)} updates")
-                for update in updates:
-                    update_id = update["update_id"]
-                    offset = update_id + 1
-                    try:
-                        msg = update.get("message", {})
-                        chat_id = msg.get("chat", {}).get("id")
-                        if not chat_id:
-                            continue
-                        text = msg.get("text", "")
-
-                        if text.startswith("/start"):
-                            handle_start(chat_id)
-                        elif msg.get("voice"):
-                            handle_voice(chat_id, msg["voice"])
-                        elif msg.get("audio"):
-                            handle_voice(chat_id, msg["audio"])
-                        elif msg.get("document"):
-                            handle_document(chat_id, msg["document"])
-                        elif text:
-                            handle_text(chat_id, text)
-                    except Exception as e:
-                        logger.error(f"Erro update {update_id}: {e}", exc_info=True)
-            else:
-                consecutive_errors += 1
-                logger.warning(f"Polling falhou ({consecutive_errors}x)")
-                if consecutive_errors > 10:
-                    time.sleep(30)
-                    consecutive_errors = 0
-                else:
-                    time.sleep(2)
-        except KeyboardInterrupt:
-            logger.info("Bot encerrado.")
-            break
-        except Exception as e:
-            consecutive_errors += 1
-            logger.error(f"Erro no loop: {e}", exc_info=True)
-            time.sleep(5)
-
-# --- Health Check HTTP Server para Render ---
-class HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header('Content-Type', 'text/plain')
-        self.end_headers()
-        self.wfile.write(b'Bot de Manutencao - Online')
-    def log_message(self, format, *args):
-        pass  # Silencia logs do HTTP server
-
-def start_health_server():
     port = int(os.environ.get('PORT', 10000))
-    server = HTTPServer(('0.0.0.0', port), HealthHandler)
-    logger.info(f'Health server na porta {port}')
-    server.serve_forever()
+    server = HTTPServer(('0.0.0.0', port), WebhookHandler)
+    logger.info(f"Servidor webhook na porta {port} - PRONTO!")
+
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        server.shutdown()
 
 if __name__ == "__main__":
-    # Inicia o health server em thread separada
-    health_thread = threading.Thread(target=start_health_server, daemon=True)
-    health_thread.start()
     main()
-
