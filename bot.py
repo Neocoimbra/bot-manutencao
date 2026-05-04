@@ -42,6 +42,10 @@ DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
 DEEPSEEK_MODEL = "deepseek-chat"
 DEEPSEEK_BASE_URL = "https://api.deepseek.com/v1"
 
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+GROQ_MODEL = "llama-3.3-70b-versatile"
+GROQ_BASE_URL = "https://api.groq.com/openai/v1"
+
 KNOWLEDGE_DIR = Path("/tmp/knowledge_base")
 KNOWLEDGE_DIR.mkdir(exist_ok=True)
 
@@ -216,7 +220,16 @@ def call_claude(prompt):
         return None
 
 def call_ai_with_fallback(prompt):
-    # 1. Gemini
+    # 1. Groq (gratuito e rápido)
+    if GROQ_API_KEY and is_api_available("groq"):
+        logger.info("Tentando Groq...")
+        res = call_openai_compatible(prompt, GROQ_API_KEY, GROQ_BASE_URL, GROQ_MODEL, "Groq")
+        if res:
+            logger.info(f"Groq respondeu ({len(res)} chars)")
+            return res
+        mark_api_failed("groq")
+
+    # 2. Gemini
     for i, key in enumerate(GEMINI_KEYS):
         name = f"gemini_{i+1}"
         if not is_api_available(name):
@@ -228,8 +241,8 @@ def call_ai_with_fallback(prompt):
             return res
         mark_api_failed(name)
 
-    # 2. DeepSeek
-    if is_api_available("deepseek"):
+    # 3. DeepSeek
+    if DEEPSEEK_API_KEY and is_api_available("deepseek"):
         logger.info("Tentando DeepSeek...")
         res = call_openai_compatible(prompt, DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL, DEEPSEEK_MODEL, "DeepSeek")
         if res:
@@ -237,8 +250,8 @@ def call_ai_with_fallback(prompt):
             return res
         mark_api_failed("deepseek")
 
-    # 3. Claude
-    if is_api_available("claude"):
+    # 4. Claude
+    if CLAUDE_API_KEY and is_api_available("claude"):
         logger.info("Tentando Claude...")
         res = call_claude(prompt)
         if res:
@@ -246,7 +259,7 @@ def call_ai_with_fallback(prompt):
             return res
         mark_api_failed("claude")
 
-    # 4. OpenAI
+    # 5. OpenAI
     if OPENAI_API_KEY:
         logger.info("Tentando OpenAI...")
         res = call_openai_compatible(prompt, OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL, "OpenAI")
