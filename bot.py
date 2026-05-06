@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 Bot de Manutenção Automotiva e Agrícola - WEBHOOK MODE para Render.com
-Multi-API com Fallback + Áudio
-Cascata: Gemini x2 -> DeepSeek -> Claude -> OpenAI -> Fallback
+Multi-API com Fallback + Áudio + Diagnóstico
+Cascata: Groq -> Gemini x2 -> DeepSeek -> Claude -> OpenAI -> Fallback
 """
 
 import os
@@ -50,12 +50,12 @@ KNOWLEDGE_DIR = Path("/tmp/knowledge_base")
 KNOWLEDGE_DIR.mkdir(exist_ok=True)
 
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "912095382"))
-
 FALLBACK_MESSAGE = "Dificuldade em processar todas as solicitações, procure o distribuidor!"
 
 # Cache de APIs com falha
 _api_fail_cache = {}
 FAIL_CACHE_TTL = 300
+_notified_errors = set()
 
 def mark_api_failed(name):
     _api_fail_cache[name] = time.time()
@@ -138,6 +138,16 @@ def download_file(file_id):
         return local_path
     return None
 
+def notify_admin_error(api_name, error_msg):
+    """Notifica o admin sobre erro de API (apenas primeira vez)"""
+    key = f"{api_name}_{error_msg[:50]}"
+    if key not in _notified_errors:
+        _notified_errors.add(key)
+        try:
+            send_message(ADMIN_ID, f"⚠️ API {api_name} falhou:\n{error_msg[:300]}")
+        except:
+            pass
+
 # --- APIs de IA ---
 def call_gemini(prompt, api_key):
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={api_key}"
@@ -158,10 +168,14 @@ def call_gemini(prompt, api_key):
                         return text
             return None
     except urllib.error.HTTPError as e:
-        logger.warning(f"Gemini ...{api_key[-6:]} falhou (HTTP {e.code})")
+        body = e.read().decode("utf-8", errors="ignore")
+        error_msg = f"HTTP {e.code}: {body[:150]}"
+        logger.warning(f"Gemini ...{api_key[-6:]} falhou: {error_msg}")
+        notify_admin_error(f"Gemini ...{api_key[-6:]}", error_msg)
         return None
     except Exception as e:
         logger.warning(f"Gemini ...{api_key[-6:]} erro: {e}")
+        notify_admin_error(f"Gemini ...{api_key[-6:]}", str(e))
         return None
 
 def call_openai_compatible(prompt, api_key, base_url, model, name="API"):
@@ -170,7 +184,10 @@ def call_openai_compatible(prompt, api_key, base_url, model, name="API"):
     url = f"{base_url}/chat/completions"
     payload = json.dumps({
         "model": model,
-        "messages": [{"role": "user", "content": prompt}],
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT_BASE},
+            {"role": "user", "content": prompt}
+        ],
         "max_tokens": 1500,
         "temperature": 0.7,
     }).encode("utf-8")
@@ -179,15 +196,22 @@ def call_openai_compatible(prompt, api_key, base_url, model, name="API"):
         "Authorization": f"Bearer {api_key}",
     })
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
+        with urllib.request.urlopen(req, timeout=45) as resp:
             data = json.loads(resp.read().decode("utf-8"))
-            return data['choices'][0]['message']['content']
+            choices = data.get('choices', [])
+            if choices:
+                return choices[0].get('message', {}).get('content', '')
+            return None
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", errors="ignore")
-        logger.warning(f"{name} falhou (HTTP {e.code}): {body[:150]}")
+        error_msg = f"HTTP {e.code}: {body[:200]}"
+        logger.warning(f"{name} falhou: {error_msg}")
+        notify_admin_error(name, error_msg)
         return None
     except Exception as e:
-        logger.warning(f"{name} erro: {e}")
+        error_msg = str(e)
+        logger.warning(f"{name} erro: {error_msg}")
+        notify_admin_error(name, error_msg)
         return None
 
 def call_claude(prompt):
@@ -213,10 +237,13 @@ def call_claude(prompt):
             return None
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", errors="ignore")
-        logger.warning(f"Claude falhou (HTTP {e.code}): {body[:150]}")
+        error_msg = f"HTTP {e.code}: {body[:150]}"
+        logger.warning(f"Claude falhou: {error_msg}")
+        notify_admin_error("Claude", error_msg)
         return None
     except Exception as e:
         logger.warning(f"Claude erro: {e}")
+        notify_admin_error("Claude", str(e))
         return None
 
 def call_ai_with_fallback(prompt):
@@ -260,12 +287,13 @@ def call_ai_with_fallback(prompt):
         mark_api_failed("claude")
 
     # 5. OpenAI
-    if OPENAI_API_KEY:
+    if OPENAI_API_KEY and is_api_available("openai"):
         logger.info("Tentando OpenAI...")
         res = call_openai_compatible(prompt, OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL, "OpenAI")
         if res:
             logger.info(f"OpenAI respondeu ({len(res)} chars)")
             return res
+        mark_api_failed("openai")
 
     logger.warning("Todas as APIs falharam!")
     return None
@@ -285,6 +313,12 @@ def transcribe_audio(audio_path):
         logger.error(f"ffmpeg exception: {e}")
         return None
 
+    # Tenta Groq Whisper primeiro (rápido e gratuito)
+    if GROQ_API_KEY:
+        text = transcribe_with_groq_whisper(wav_path)
+        if text:
+            return text
+
     # Tenta Gemini multimodal
     for i, key in enumerate(GEMINI_KEYS):
         name = f"gemini_stt_{i+1}"
@@ -302,6 +336,44 @@ def transcribe_audio(audio_path):
             return text
 
     return None
+
+def transcribe_with_groq_whisper(wav_path):
+    """Transcreve áudio usando Groq Whisper API"""
+    if not GROQ_API_KEY:
+        return None
+    import http.client
+    try:
+        boundary = "----FormBoundary7MA4YWxkGroq"
+        with open(wav_path, "rb") as f:
+            file_data = f.read()
+        body = b""
+        body += f"--{boundary}\r\n".encode()
+        body += b'Content-Disposition: form-data; name="file"; filename="audio.wav"\r\n'
+        body += b"Content-Type: audio/wav\r\n\r\n"
+        body += file_data
+        body += b"\r\n"
+        body += f"--{boundary}\r\n".encode()
+        body += b'Content-Disposition: form-data; name="model"\r\n\r\n'
+        body += b"whisper-large-v3\r\n"
+        body += f"--{boundary}\r\n".encode()
+        body += b'Content-Disposition: form-data; name="language"\r\n\r\n'
+        body += b"pt\r\n"
+        body += f"--{boundary}--\r\n".encode()
+        conn = http.client.HTTPSConnection("api.groq.com", timeout=30)
+        conn.request("POST", "/openai/v1/audio/transcriptions", body=body, headers={
+            "Authorization": f"Bearer {GROQ_API_KEY}",
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+        })
+        resp = conn.getresponse()
+        data = json.loads(resp.read().decode("utf-8"))
+        conn.close()
+        if resp.status == 200:
+            return data.get("text", "")
+        logger.warning(f"Groq Whisper falhou (HTTP {resp.status}): {json.dumps(data)[:150]}")
+        return None
+    except Exception as e:
+        logger.warning(f"Groq Whisper erro: {e}")
+        return None
 
 def transcribe_with_gemini(wav_path, api_key):
     try:
@@ -407,6 +479,189 @@ def handle_start(chat_id):
         "Como posso ajudar no diagnóstico hoje?"
     )
 
+def handle_status(chat_id):
+    """Mostra status das APIs configuradas"""
+    if chat_id != ADMIN_ID:
+        send_message(chat_id, "⚠️ Comando disponível apenas para o administrador.")
+        return
+    
+    def mask_key(key):
+        if not key:
+            return "❌ NÃO CONFIGURADA"
+        return f"✅ Configurada ({key[:8]}...{key[-4:]})"
+    
+    status = (
+        "📊 STATUS DAS APIs:\n\n"
+        f"🔹 GROQ_API_KEY: {mask_key(GROQ_API_KEY)}\n"
+        f"   Modelo: {GROQ_MODEL}\n"
+        f"   URL: {GROQ_BASE_URL}\n\n"
+        f"🔹 GEMINI_KEY_1: {mask_key(gk1)}\n"
+        f"🔹 GEMINI_KEY_2: {mask_key(gk2)}\n"
+        f"   Modelo: {GEMINI_MODEL}\n\n"
+        f"🔹 DEEPSEEK_API_KEY: {mask_key(DEEPSEEK_API_KEY)}\n"
+        f"   Modelo: {DEEPSEEK_MODEL}\n\n"
+        f"🔹 CLAUDE_API_KEY: {mask_key(CLAUDE_API_KEY)}\n"
+        f"   Modelo: {CLAUDE_MODEL}\n\n"
+        f"🔹 OPENAI_API_KEY: {mask_key(OPENAI_API_KEY)}\n"
+        f"   Modelo: {OPENAI_MODEL}\n"
+        f"   URL: {OPENAI_BASE_URL}\n\n"
+        f"🔹 TELEGRAM_TOKEN: {mask_key(TELEGRAM_TOKEN)}\n"
+        f"🔹 RENDER_URL: {RENDER_URL or '❌ NÃO CONFIGURADA'}\n"
+        f"🔹 ADMIN_ID: {ADMIN_ID}\n\n"
+        f"📁 Manuais no banco: {sum(1 for f in KNOWLEDGE_DIR.iterdir() if f.suffix == '.txt')}\n"
+        f"🚫 APIs em cache de falha: {list(_api_fail_cache.keys()) if _api_fail_cache else 'nenhuma'}"
+    )
+    send_message(chat_id, status)
+
+def handle_diag(chat_id):
+    """Testa cada API individualmente"""
+    if chat_id != ADMIN_ID:
+        send_message(chat_id, "⚠️ Comando disponível apenas para o administrador.")
+        return
+    
+    send_message(chat_id, "🔍 Iniciando diagnóstico de APIs... (pode levar até 1 minuto)")
+    send_typing(chat_id)
+    
+    results = []
+    test_prompt = "Diga apenas: OK FUNCIONANDO"
+    
+    # Teste Groq
+    if GROQ_API_KEY:
+        try:
+            url = f"{GROQ_BASE_URL}/chat/completions"
+            payload = json.dumps({
+                "model": GROQ_MODEL,
+                "messages": [{"role": "user", "content": test_prompt}],
+                "max_tokens": 20,
+            }).encode("utf-8")
+            req = urllib.request.Request(url, data=payload, headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {GROQ_API_KEY}",
+            })
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                reply = data.get('choices', [{}])[0].get('message', {}).get('content', '')
+                results.append(f"✅ Groq: OK - \"{reply[:50]}\"")
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", errors="ignore")
+            results.append(f"❌ Groq: HTTP {e.code} - {body[:100]}")
+        except Exception as e:
+            results.append(f"❌ Groq: {str(e)[:100]}")
+    else:
+        results.append("⚪ Groq: CHAVE NÃO CONFIGURADA")
+    
+    # Teste Gemini
+    for i, key in enumerate(GEMINI_KEYS):
+        try:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={key}"
+            payload = json.dumps({
+                "contents": [{"parts": [{"text": test_prompt}]}],
+                "generationConfig": {"maxOutputTokens": 20},
+            }).encode("utf-8")
+            req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                candidates = data.get("candidates", [])
+                if candidates:
+                    text = candidates[0].get("content", {}).get("parts", [{}])[0].get("text", "")
+                    results.append(f"✅ Gemini key {i+1}: OK - \"{text[:50]}\"")
+                else:
+                    results.append(f"❌ Gemini key {i+1}: Sem candidates na resposta")
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", errors="ignore")
+            results.append(f"❌ Gemini key {i+1}: HTTP {e.code} - {body[:100]}")
+        except Exception as e:
+            results.append(f"❌ Gemini key {i+1}: {str(e)[:100]}")
+    if not GEMINI_KEYS:
+        results.append("⚪ Gemini: NENHUMA CHAVE CONFIGURADA")
+    
+    # Teste DeepSeek
+    if DEEPSEEK_API_KEY:
+        try:
+            url = f"{DEEPSEEK_BASE_URL}/chat/completions"
+            payload = json.dumps({
+                "model": DEEPSEEK_MODEL,
+                "messages": [{"role": "user", "content": test_prompt}],
+                "max_tokens": 20,
+            }).encode("utf-8")
+            req = urllib.request.Request(url, data=payload, headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+            })
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                reply = data.get('choices', [{}])[0].get('message', {}).get('content', '')
+                results.append(f"✅ DeepSeek: OK - \"{reply[:50]}\"")
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", errors="ignore")
+            results.append(f"❌ DeepSeek: HTTP {e.code} - {body[:100]}")
+        except Exception as e:
+            results.append(f"❌ DeepSeek: {str(e)[:100]}")
+    else:
+        results.append("⚪ DeepSeek: CHAVE NÃO CONFIGURADA")
+    
+    # Teste Claude
+    if CLAUDE_API_KEY:
+        try:
+            url = "https://api.anthropic.com/v1/messages"
+            payload = json.dumps({
+                "model": CLAUDE_MODEL,
+                "max_tokens": 20,
+                "messages": [{"role": "user", "content": test_prompt}],
+            }).encode("utf-8")
+            req = urllib.request.Request(url, data=payload, headers={
+                "Content-Type": "application/json",
+                "x-api-key": CLAUDE_API_KEY,
+                "anthropic-version": "2023-06-01",
+            })
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                content = data.get("content", [])
+                if content:
+                    results.append(f"✅ Claude: OK - \"{content[0].get('text', '')[:50]}\"")
+                else:
+                    results.append(f"❌ Claude: Resposta vazia")
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", errors="ignore")
+            results.append(f"❌ Claude: HTTP {e.code} - {body[:100]}")
+        except Exception as e:
+            results.append(f"❌ Claude: {str(e)[:100]}")
+    else:
+        results.append("⚪ Claude: CHAVE NÃO CONFIGURADA")
+    
+    # Teste OpenAI
+    if OPENAI_API_KEY:
+        try:
+            url = f"{OPENAI_BASE_URL}/chat/completions"
+            payload = json.dumps({
+                "model": OPENAI_MODEL,
+                "messages": [{"role": "user", "content": test_prompt}],
+                "max_tokens": 20,
+            }).encode("utf-8")
+            req = urllib.request.Request(url, data=payload, headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {OPENAI_API_KEY}",
+            })
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                reply = data.get('choices', [{}])[0].get('message', {}).get('content', '')
+                results.append(f"✅ OpenAI: OK - \"{reply[:50]}\"")
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", errors="ignore")
+            results.append(f"❌ OpenAI: HTTP {e.code} - {body[:100]}")
+        except Exception as e:
+            results.append(f"❌ OpenAI: {str(e)[:100]}")
+    else:
+        results.append("⚪ OpenAI: CHAVE NÃO CONFIGURADA")
+    
+    # Limpar cache de falhas
+    _api_fail_cache.clear()
+    _notified_errors.clear()
+    
+    report = "🔍 RESULTADO DO DIAGNÓSTICO:\n\n" + "\n\n".join(results)
+    report += "\n\n🔄 Cache de falhas limpo."
+    send_message(chat_id, report)
+
 def handle_text(chat_id, text):
     logger.info(f"Texto de {chat_id}: {text[:80]}")
     send_typing(chat_id)
@@ -482,6 +737,10 @@ def process_update(update):
         text = msg.get("text", "")
         if text.startswith("/start"):
             handle_start(chat_id)
+        elif text.startswith("/status"):
+            handle_status(chat_id)
+        elif text.startswith("/diag"):
+            handle_diag(chat_id)
         elif msg.get("voice"):
             handle_voice(chat_id, msg["voice"])
         elif msg.get("audio"):
@@ -557,9 +816,10 @@ def main():
         sys.exit(1)
 
     logger.info("=" * 50)
-    logger.info("BOT MANUTENÇÃO - WEBHOOK MODE")
+    logger.info("BOT MANUTENÇÃO - WEBHOOK MODE v2.0")
     logger.info(f"Render URL: {RENDER_URL}")
     logger.info(f"Admin ID: {ADMIN_ID}")
+    logger.info(f"Groq: {'sim' if GROQ_API_KEY else 'não'}")
     logger.info(f"Gemini keys: {len(GEMINI_KEYS)}")
     logger.info(f"DeepSeek: {'sim' if DEEPSEEK_API_KEY else 'não'}")
     logger.info(f"Claude: {'sim' if CLAUDE_API_KEY else 'não'}")
