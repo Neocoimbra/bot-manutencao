@@ -49,6 +49,9 @@ GROQ_BASE_URL = "https://api.groq.com/openai/v1"
 KNOWLEDGE_DIR = Path("/tmp/knowledge_base")
 KNOWLEDGE_DIR.mkdir(exist_ok=True)
 
+# User-Agent necessário para evitar bloqueio Cloudflare (erro 1010)
+USER_AGENT = "ManutBot/2.0 (Python urllib)"
+
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "912095382"))
 FALLBACK_MESSAGE = "Dificuldade em processar todas as solicitações, procure o distribuidor!"
 
@@ -155,7 +158,7 @@ def call_gemini(prompt, api_key):
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {"maxOutputTokens": 2000, "temperature": 0.7},
     }).encode("utf-8")
-    req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
+    req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json", "User-Agent": USER_AGENT})
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
             result = json.loads(resp.read().decode("utf-8"))
@@ -194,6 +197,7 @@ def call_openai_compatible(prompt, api_key, base_url, model, name="API"):
     req = urllib.request.Request(url, data=payload, headers={
         "Content-Type": "application/json",
         "Authorization": f"Bearer {api_key}",
+        "User-Agent": USER_AGENT,
     })
     try:
         with urllib.request.urlopen(req, timeout=45) as resp:
@@ -227,6 +231,7 @@ def call_claude(prompt):
         "Content-Type": "application/json",
         "x-api-key": CLAUDE_API_KEY,
         "anthropic-version": "2023-06-01",
+        "User-Agent": USER_AGENT,
     })
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
@@ -387,7 +392,7 @@ def transcribe_with_gemini(wav_path, api_key):
             ]}],
             "generationConfig": {"maxOutputTokens": 500, "temperature": 0.1},
         }).encode("utf-8")
-        req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
+        req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json", "User-Agent": USER_AGENT})
         with urllib.request.urlopen(req, timeout=30) as resp:
             result = json.loads(resp.read().decode("utf-8"))
             candidates = result.get("candidates", [])
@@ -537,6 +542,7 @@ def handle_diag(chat_id):
             req = urllib.request.Request(url, data=payload, headers={
                 "Content-Type": "application/json",
                 "Authorization": f"Bearer {GROQ_API_KEY}",
+                "User-Agent": USER_AGENT,
             })
             with urllib.request.urlopen(req, timeout=15) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
@@ -558,7 +564,7 @@ def handle_diag(chat_id):
                 "contents": [{"parts": [{"text": test_prompt}]}],
                 "generationConfig": {"maxOutputTokens": 20},
             }).encode("utf-8")
-            req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
+            req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json", "User-Agent": USER_AGENT})
             with urllib.request.urlopen(req, timeout=15) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
                 candidates = data.get("candidates", [])
@@ -587,6 +593,7 @@ def handle_diag(chat_id):
             req = urllib.request.Request(url, data=payload, headers={
                 "Content-Type": "application/json",
                 "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+                "User-Agent": USER_AGENT,
             })
             with urllib.request.urlopen(req, timeout=15) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
@@ -613,6 +620,7 @@ def handle_diag(chat_id):
                 "Content-Type": "application/json",
                 "x-api-key": CLAUDE_API_KEY,
                 "anthropic-version": "2023-06-01",
+                "User-Agent": USER_AGENT,
             })
             with urllib.request.urlopen(req, timeout=15) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
@@ -641,11 +649,13 @@ def handle_diag(chat_id):
             req = urllib.request.Request(url, data=payload, headers={
                 "Content-Type": "application/json",
                 "Authorization": f"Bearer {OPENAI_API_KEY}",
+                "User-Agent": USER_AGENT,
             })
             with urllib.request.urlopen(req, timeout=15) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
                 reply = data.get('choices', [{}])[0].get('message', {}).get('content', '')
                 results.append(f"✅ OpenAI: OK - \"{reply[:50]}\"")
+
         except urllib.error.HTTPError as e:
             body = e.read().decode("utf-8", errors="ignore")
             results.append(f"❌ OpenAI: HTTP {e.code} - {body[:100]}")
