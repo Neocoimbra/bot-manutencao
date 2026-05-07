@@ -55,6 +55,36 @@ USER_AGENT = "ManutBot/2.0 (Python urllib)"
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "912095382"))
 FALLBACK_MESSAGE = "Dificuldade em processar todas as solicitações, procure o distribuidor!"
 
+# Histórico de conversas por chat_id (memória)
+_chat_history = {}  # {chat_id: [{"role": "user", "content": "..."}, {"role": "assistant", "content": "..."}]}
+MAX_HISTORY = 10  # Máximo de pares de mensagens por chat (20 mensagens total)
+HISTORY_TTL = 3600  # 1 hora sem atividade limpa o histórico
+_chat_last_active = {}  # {chat_id: timestamp}
+
+def add_to_history(chat_id, role, content):
+    """Adiciona mensagem ao histórico do chat"""
+    if chat_id not in _chat_history:
+        _chat_history[chat_id] = []
+    _chat_history[chat_id].append({"role": role, "content": content})
+    # Manter apenas as últimas MAX_HISTORY*2 mensagens
+    if len(_chat_history[chat_id]) > MAX_HISTORY * 2:
+        _chat_history[chat_id] = _chat_history[chat_id][-(MAX_HISTORY * 2):]
+    _chat_last_active[chat_id] = time.time()
+
+def get_history(chat_id):
+    """Retorna o histórico do chat, limpando se expirou"""
+    if chat_id in _chat_last_active:
+        if time.time() - _chat_last_active[chat_id] > HISTORY_TTL:
+            _chat_history.pop(chat_id, None)
+            _chat_last_active.pop(chat_id, None)
+            return []
+    return _chat_history.get(chat_id, [])
+
+def clear_history(chat_id):
+    """Limpa o histórico de um chat"""
+    _chat_history.pop(chat_id, None)
+    _chat_last_active.pop(chat_id, None)
+
 # Cache de APIs com falha
 _api_fail_cache = {}
 FAIL_CACHE_TTL = 300
@@ -181,16 +211,14 @@ def call_gemini(prompt, api_key):
         notify_admin_error(f"Gemini ...{api_key[-6:]}", str(e))
         return None
 
-def call_openai_compatible(prompt, api_key, base_url, model, name="API"):
+def call_openai_compatible(messages_list, api_key, base_url, model, name="API"):
+    """Chama API compatível com OpenAI. messages_list é lista de dicts com role/content."""
     if not api_key:
         return None
     url = f"{base_url}/chat/completions"
     payload = json.dumps({
         "model": model,
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT_BASE},
-            {"role": "user", "content": prompt}
-        ],
+        "messages": messages_list,
         "max_tokens": 1500,
         "temperature": 0.7,
     }).encode("utf-8")
@@ -251,23 +279,24 @@ def call_claude(prompt):
         notify_admin_error("Claude", str(e))
         return None
 
-def call_ai_with_fallback(prompt):
+def call_ai_with_fallback(messages_list, gemini_prompt):
+    """Tenta APIs em cascata. messages_list para APIs OpenAI-compat, gemini_prompt para Gemini."""
     # 1. Groq (gratuito e rápido)
     if GROQ_API_KEY and is_api_available("groq"):
         logger.info("Tentando Groq...")
-        res = call_openai_compatible(prompt, GROQ_API_KEY, GROQ_BASE_URL, GROQ_MODEL, "Groq")
+        res = call_openai_compatible(messages_list, GROQ_API_KEY, GROQ_BASE_URL, GROQ_MODEL, "Groq")
         if res:
             logger.info(f"Groq respondeu ({len(res)} chars)")
             return res
         mark_api_failed("groq")
 
-    # 2. Gemini
+    # 2. Gemini (não suporta histórico multi-turn facilmente, usa prompt concatenado)
     for i, key in enumerate(GEMINI_KEYS):
         name = f"gemini_{i+1}"
         if not is_api_available(name):
             continue
         logger.info(f"Tentando Gemini key {i+1}...")
-        res = call_gemini(prompt, key)
+        res = call_gemini(gemini_prompt, key)
         if res:
             logger.info(f"Gemini respondeu ({len(res)} chars)")
             return res
@@ -276,7 +305,7 @@ def call_ai_with_fallback(prompt):
     # 3. DeepSeek
     if DEEPSEEK_API_KEY and is_api_available("deepseek"):
         logger.info("Tentando DeepSeek...")
-        res = call_openai_compatible(prompt, DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL, DEEPSEEK_MODEL, "DeepSeek")
+        res = call_openai_compatible(messages_list, DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL, DEEPSEEK_MODEL, "DeepSeek")
         if res:
             logger.info(f"DeepSeek respondeu ({len(res)} chars)")
             return res
@@ -285,7 +314,7 @@ def call_ai_with_fallback(prompt):
     # 4. Claude
     if CLAUDE_API_KEY and is_api_available("claude"):
         logger.info("Tentando Claude...")
-        res = call_claude(prompt)
+        res = call_claude(gemini_prompt)
         if res:
             logger.info(f"Claude respondeu ({len(res)} chars)")
             return res
@@ -294,7 +323,7 @@ def call_ai_with_fallback(prompt):
     # 5. OpenAI
     if OPENAI_API_KEY and is_api_available("openai"):
         logger.info("Tentando OpenAI...")
-        res = call_openai_compatible(prompt, OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL, "OpenAI")
+        res = call_openai_compatible(messages_list, OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL, "OpenAI")
         if res:
             logger.info(f"OpenAI respondeu ({len(res)} chars)")
             return res
@@ -458,7 +487,8 @@ def load_knowledge_base():
                 pass
     return "\n\n---\n\n".join(texts) if texts else ""
 
-def build_full_prompt(user_text):
+def build_system_prompt():
+    """Constrói o system prompt com base de conhecimento"""
     knowledge = load_knowledge_base()
     prompt = SYSTEM_PROMPT_BASE
     if knowledge:
@@ -466,11 +496,41 @@ def build_full_prompt(user_text):
             "\n\n=== INFORMAÇÕES DOS MANUAIS (PRIORIDADE MÁXIMA) ===\n"
             + knowledge[:4000]
         )
-    prompt += f"\n\nPergunta do usuário: {user_text}"
+    return prompt
+
+def build_messages_with_history(chat_id, user_text):
+    """Constrói lista de mensagens com histórico para APIs OpenAI-compatible"""
+    system_prompt = build_system_prompt()
+    messages = [{"role": "system", "content": system_prompt}]
+    
+    # Adiciona histórico anterior
+    history = get_history(chat_id)
+    for msg in history:
+        messages.append(msg)
+    
+    # Adiciona mensagem atual
+    messages.append({"role": "user", "content": user_text})
+    return messages
+
+def build_gemini_prompt_with_history(chat_id, user_text):
+    """Constrói prompt concatenado com histórico para Gemini"""
+    system_prompt = build_system_prompt()
+    prompt = system_prompt
+    
+    # Adiciona histórico como contexto
+    history = get_history(chat_id)
+    if history:
+        prompt += "\n\n=== HISTÓRICO DA CONVERSA ===\n"
+        for msg in history:
+            role_label = "Usuário" if msg["role"] == "user" else "Assistente"
+            prompt += f"{role_label}: {msg['content'][:500]}\n\n"
+    
+    prompt += f"Pergunta atual do usuário: {user_text}"
     return prompt
 
 # --- Handlers ---
 def handle_start(chat_id):
+    clear_history(chat_id)
     send_message(chat_id,
         "🔧 Especialista em Manutenção Online!\n\n"
         "Sou um assistente de IA especializado em manutenção e reparação de "
@@ -478,9 +538,14 @@ def handle_start(chat_id):
         "📋 O que posso fazer:\n"
         "• Responder dúvidas sobre manutenção preventiva e corretiva\n"
         "• Ajudar a diagnosticar problemas em equipamentos\n"
-        "• Orientar sobre procedimentos de reparo\n\n"
+        "• Orientar sobre procedimentos de reparo\n"
+        "• Lembrar do contexto da conversa (memória)\n\n"
         "📄 Aceito documentos (PDF, Word, TXT) com manuais técnicos\n"
         "🎤 Aceito mensagens de voz e áudio!\n\n"
+        "📌 Comandos:\n"
+        "/limpar - Limpar histórico e começar novo assunto\n"
+        "/status - Ver status das APIs (admin)\n"
+        "/diag - Diagnosticar APIs (admin)\n\n"
         "Como posso ajudar no diagnóstico hoje?"
     )
 
@@ -673,10 +738,28 @@ def handle_diag(chat_id):
     send_message(chat_id, report)
 
 def handle_text(chat_id, text):
+    # Comando para limpar histórico
+    if text.strip().lower() in ["/limpar", "/novo", "/reset"]:
+        clear_history(chat_id)
+        send_message(chat_id, "🔄 Histórico limpo! Pode começar um novo assunto.")
+        return
+    
     logger.info(f"Texto de {chat_id}: {text[:80]}")
     send_typing(chat_id)
-    reply = call_ai_with_fallback(build_full_prompt(text))
-    send_message(chat_id, reply if reply else FALLBACK_MESSAGE)
+    
+    # Construir mensagens com histórico
+    messages = build_messages_with_history(chat_id, text)
+    gemini_prompt = build_gemini_prompt_with_history(chat_id, text)
+    
+    reply = call_ai_with_fallback(messages, gemini_prompt)
+    
+    if reply:
+        # Salvar no histórico
+        add_to_history(chat_id, "user", text)
+        add_to_history(chat_id, "assistant", reply)
+        send_message(chat_id, reply)
+    else:
+        send_message(chat_id, FALLBACK_MESSAGE)
 
 def handle_voice(chat_id, voice_or_audio):
     file_id = voice_or_audio.get("file_id")
@@ -694,8 +777,19 @@ def handle_voice(chat_id, voice_or_audio):
             return
         send_message(chat_id, f"🎤 Entendi: \"{transcribed}\"\n\nProcessando resposta...")
         send_typing(chat_id)
-        reply = call_ai_with_fallback(build_full_prompt(transcribed))
-        send_message(chat_id, reply if reply else FALLBACK_MESSAGE)
+        
+        # Construir mensagens com histórico
+        messages = build_messages_with_history(chat_id, transcribed)
+        gemini_prompt = build_gemini_prompt_with_history(chat_id, transcribed)
+        
+        reply = call_ai_with_fallback(messages, gemini_prompt)
+        
+        if reply:
+            add_to_history(chat_id, "user", transcribed)
+            add_to_history(chat_id, "assistant", reply)
+            send_message(chat_id, reply)
+        else:
+            send_message(chat_id, FALLBACK_MESSAGE)
     except Exception as e:
         logger.error(f"Erro áudio: {e}", exc_info=True)
         send_message(chat_id, "Desculpe, erro ao processar o áudio.")
