@@ -85,6 +85,61 @@ def clear_history(chat_id):
     _chat_history.pop(chat_id, None)
     _chat_last_active.pop(chat_id, None)
 
+# Estatísticas de uso
+_stats = {
+    "total_messages": 0,
+    "total_audio": 0,
+    "total_documents": 0,
+    "users": {},  # {chat_id: {"name": "", "messages": 0, "last_active": 0}}
+    "api_calls": {},  # {api_name: {"success": 0, "fail": 0}}
+    "start_time": time.time(),
+    "errors": [],  # últimos 50 erros
+}
+STATS_FILE = Path("/tmp/bot_stats.json")
+
+def save_stats():
+    try:
+        STATS_FILE.write_text(json.dumps(_stats, default=str), encoding="utf-8")
+    except:
+        pass
+
+def load_stats():
+    global _stats
+    try:
+        if STATS_FILE.exists():
+            loaded = json.loads(STATS_FILE.read_text(encoding="utf-8"))
+            _stats.update(loaded)
+    except:
+        pass
+
+def track_message(chat_id, user_name=""):
+    _stats["total_messages"] += 1
+    if str(chat_id) not in _stats["users"]:
+        _stats["users"][str(chat_id)] = {"name": user_name, "messages": 0, "last_active": 0}
+    _stats["users"][str(chat_id)]["messages"] += 1
+    _stats["users"][str(chat_id)]["last_active"] = time.time()
+    if user_name:
+        _stats["users"][str(chat_id)]["name"] = user_name
+    save_stats()
+
+def track_api_call(api_name, success=True):
+    if api_name not in _stats["api_calls"]:
+        _stats["api_calls"][api_name] = {"success": 0, "fail": 0}
+    if success:
+        _stats["api_calls"][api_name]["success"] += 1
+    else:
+        _stats["api_calls"][api_name]["fail"] += 1
+    save_stats()
+
+def track_error(error_msg):
+    _stats["errors"].append({"time": time.time(), "msg": error_msg[:200]})
+    if len(_stats["errors"]) > 50:
+        _stats["errors"] = _stats["errors"][-50:]
+    save_stats()
+
+# Senha do painel admin (variável de ambiente ou padrão)
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "manut2024")
+
 # Cache de APIs com falha
 _api_fail_cache = {}
 FAIL_CACHE_TTL = 300
@@ -287,7 +342,9 @@ def call_ai_with_fallback(messages_list, gemini_prompt):
         res = call_openai_compatible(messages_list, GROQ_API_KEY, GROQ_BASE_URL, GROQ_MODEL, "Groq")
         if res:
             logger.info(f"Groq respondeu ({len(res)} chars)")
+            track_api_call("Groq", True)
             return res
+        track_api_call("Groq", False)
         mark_api_failed("groq")
 
     # 2. Gemini (não suporta histórico multi-turn facilmente, usa prompt concatenado)
@@ -299,7 +356,9 @@ def call_ai_with_fallback(messages_list, gemini_prompt):
         res = call_gemini(gemini_prompt, key)
         if res:
             logger.info(f"Gemini respondeu ({len(res)} chars)")
+            track_api_call(f"Gemini_{i+1}", True)
             return res
+        track_api_call(f"Gemini_{i+1}", False)
         mark_api_failed(name)
 
     # 3. DeepSeek
@@ -308,7 +367,9 @@ def call_ai_with_fallback(messages_list, gemini_prompt):
         res = call_openai_compatible(messages_list, DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL, DEEPSEEK_MODEL, "DeepSeek")
         if res:
             logger.info(f"DeepSeek respondeu ({len(res)} chars)")
+            track_api_call("DeepSeek", True)
             return res
+        track_api_call("DeepSeek", False)
         mark_api_failed("deepseek")
 
     # 4. Claude
@@ -317,7 +378,9 @@ def call_ai_with_fallback(messages_list, gemini_prompt):
         res = call_claude(gemini_prompt)
         if res:
             logger.info(f"Claude respondeu ({len(res)} chars)")
+            track_api_call("Claude", True)
             return res
+        track_api_call("Claude", False)
         mark_api_failed("claude")
 
     # 5. OpenAI
@@ -326,10 +389,13 @@ def call_ai_with_fallback(messages_list, gemini_prompt):
         res = call_openai_compatible(messages_list, OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL, "OpenAI")
         if res:
             logger.info(f"OpenAI respondeu ({len(res)} chars)")
+            track_api_call("OpenAI", True)
             return res
+        track_api_call("OpenAI", False)
         mark_api_failed("openai")
 
     logger.warning("Todas as APIs falharam!")
+    track_error("Todas as APIs falharam")
     return None
 
 # --- Transcrição de Áudio ---
@@ -838,6 +904,13 @@ def process_update(update):
         chat_id = msg.get("chat", {}).get("id")
         if not chat_id:
             return
+        
+        # Tracking de usuário
+        user = msg.get("from", {})
+        user_name = user.get("first_name", "") + " " + user.get("last_name", "")
+        user_name = user_name.strip() or str(chat_id)
+        track_message(chat_id, user_name)
+        
         text = msg.get("text", "")
         if text.startswith("/start"):
             handle_start(chat_id)
@@ -846,43 +919,357 @@ def process_update(update):
         elif text.startswith("/diag"):
             handle_diag(chat_id)
         elif msg.get("voice"):
+            _stats["total_audio"] += 1
             handle_voice(chat_id, msg["voice"])
         elif msg.get("audio"):
+            _stats["total_audio"] += 1
             handle_voice(chat_id, msg["audio"])
         elif msg.get("document"):
+            _stats["total_documents"] += 1
             handle_document(chat_id, msg["document"])
         elif text:
             handle_text(chat_id, text)
     except Exception as e:
         logger.error(f"Erro update: {e}", exc_info=True)
+        track_error(str(e))
 
 # --- Webhook HTTP Server ---
+def check_admin_auth(handler):
+    """Verifica autenticação básica para o painel admin"""
+    auth = handler.headers.get('Authorization', '')
+    if auth.startswith('Basic '):
+        try:
+            decoded = base64.b64decode(auth[6:]).decode('utf-8')
+            user, pwd = decoded.split(':', 1)
+            if user == 'admin' and pwd == ADMIN_PASSWORD:
+                return True
+        except:
+            pass
+    return False
+
+def send_auth_required(handler):
+    handler.send_response(401)
+    handler.send_header('WWW-Authenticate', 'Basic realm="Admin Panel"')
+    handler.send_header('Content-Type', 'text/html')
+    handler.end_headers()
+    handler.wfile.write(b'<h1>Acesso negado</h1><p>Credenciais inv\xc3\xa1lidas.</p>')
+
+def get_admin_html():
+    uptime = time.time() - _stats.get("start_time", time.time())
+    hours = int(uptime // 3600)
+    minutes = int((uptime % 3600) // 60)
+    
+    # Usuários ativos (últimas 24h)
+    now = time.time()
+    active_24h = sum(1 for u in _stats["users"].values() if now - u.get("last_active", 0) < 86400)
+    
+    # Manuais
+    manuals = []
+    for f in KNOWLEDGE_DIR.iterdir():
+        if f.suffix == ".txt":
+            size = f.stat().st_size
+            manuals.append({"name": f.stem, "size": size})
+    
+    # API stats
+    api_rows = ""
+    for api_name, counts in _stats.get("api_calls", {}).items():
+        total = counts["success"] + counts["fail"]
+        rate = (counts["success"] / total * 100) if total > 0 else 0
+        api_rows += f'<tr><td>{api_name}</td><td>{counts["success"]}</td><td>{counts["fail"]}</td><td>{rate:.0f}%</td></tr>'
+    
+    # Usuários
+    user_rows = ""
+    sorted_users = sorted(_stats.get("users", {}).items(), key=lambda x: x[1].get("messages", 0), reverse=True)
+    for uid, udata in sorted_users[:20]:
+        last = time.strftime("%d/%m %H:%M", time.localtime(udata.get("last_active", 0))) if udata.get("last_active") else "-"
+        user_rows += f'<tr><td>{udata.get("name", uid)}</td><td>{uid}</td><td>{udata.get("messages", 0)}</td><td>{last}</td></tr>'
+    
+    # Manuais
+    manual_rows = ""
+    for m in manuals:
+        size_kb = m["size"] / 1024
+        manual_rows += f'<tr><td>{m["name"]}</td><td>{size_kb:.1f} KB</td><td><a href="/admin/manual/delete?name={urllib.parse.quote(m["name"])}" onclick="return confirm(\'Remover este manual?\')">🗑️ Remover</a></td></tr>'
+    
+    # Erros recentes
+    error_rows = ""
+    for err in reversed(_stats.get("errors", [])[-10:]):
+        t_str = time.strftime("%d/%m %H:%M:%S", time.localtime(err.get("time", 0)))
+        error_rows += f'<tr><td>{t_str}</td><td>{err.get("msg", "")}</td></tr>'
+    
+    # APIs configuradas
+    apis_status = ""
+    apis_config = [
+        ("Groq", bool(GROQ_API_KEY)),
+        ("Gemini 1", bool(gk1)),
+        ("Gemini 2", bool(gk2)),
+        ("DeepSeek", bool(DEEPSEEK_API_KEY)),
+        ("Claude", bool(CLAUDE_API_KEY)),
+        ("OpenAI", bool(OPENAI_API_KEY)),
+    ]
+    for name, configured in apis_config:
+        icon = "🟢" if configured else "🔴"
+        apis_status += f'<span style="margin-right:15px">{icon} {name}</span>'
+
+    html = f"""<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>🔧 Bot Manutenção - Painel Admin</title>
+    <style>
+        * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+        body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #1a1a2e; color: #eee; padding: 20px; }}
+        .container {{ max-width: 1200px; margin: 0 auto; }}
+        h1 {{ color: #00d4aa; margin-bottom: 5px; font-size: 1.8em; }}
+        h2 {{ color: #00d4aa; margin: 25px 0 10px; font-size: 1.3em; border-bottom: 1px solid #333; padding-bottom: 5px; }}
+        .subtitle {{ color: #888; margin-bottom: 20px; }}
+        .cards {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; margin: 20px 0; }}
+        .card {{ background: #16213e; border-radius: 10px; padding: 20px; text-align: center; }}
+        .card .number {{ font-size: 2.5em; font-weight: bold; color: #00d4aa; }}
+        .card .label {{ color: #888; margin-top: 5px; }}
+        table {{ width: 100%; border-collapse: collapse; margin: 10px 0; background: #16213e; border-radius: 8px; overflow: hidden; }}
+        th, td {{ padding: 10px 15px; text-align: left; border-bottom: 1px solid #2a2a4a; }}
+        th {{ background: #0f3460; color: #00d4aa; }}
+        tr:hover {{ background: #1a1a3e; }}
+        .apis-bar {{ background: #16213e; padding: 15px; border-radius: 8px; margin: 10px 0; }}
+        a {{ color: #ff6b6b; text-decoration: none; }}
+        a:hover {{ text-decoration: underline; }}
+        .upload-form {{ background: #16213e; padding: 20px; border-radius: 8px; margin: 10px 0; }}
+        input[type="file"] {{ margin: 10px 0; }}
+        button {{ background: #00d4aa; color: #1a1a2e; border: none; padding: 10px 20px; border-radius: 5px; cursor: pointer; font-weight: bold; }}
+        button:hover {{ background: #00b894; }}
+        .refresh {{ float: right; font-size: 0.9em; }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🔧 Bot Especialista em Manutenção</h1>
+        <p class="subtitle">Painel Administrativo | Uptime: {hours}h {minutes}min</p>
+        
+        <div class="cards">
+            <div class="card">
+                <div class="number">{_stats.get('total_messages', 0)}</div>
+                <div class="label">Mensagens</div>
+            </div>
+            <div class="card">
+                <div class="number">{len(_stats.get('users', {}))}</div>
+                <div class="label">Usuários Total</div>
+            </div>
+            <div class="card">
+                <div class="number">{active_24h}</div>
+                <div class="label">Ativos (24h)</div>
+            </div>
+            <div class="card">
+                <div class="number">{_stats.get('total_audio', 0)}</div>
+                <div class="label">Áudios</div>
+            </div>
+            <div class="card">
+                <div class="number">{len(manuals)}</div>
+                <div class="label">Manuais</div>
+            </div>
+            <div class="card">
+                <div class="number">{_stats.get('total_documents', 0)}</div>
+                <div class="label">Docs Recebidos</div>
+            </div>
+        </div>
+
+        <h2>🔌 APIs Configuradas</h2>
+        <div class="apis-bar">{apis_status}</div>
+
+        <h2>📊 Uso das APIs</h2>
+        <table>
+            <tr><th>API</th><th>Sucesso</th><th>Falha</th><th>Taxa</th></tr>
+            {api_rows if api_rows else '<tr><td colspan="4">Nenhuma chamada registrada ainda</td></tr>'}
+        </table>
+
+        <h2>👥 Usuários</h2>
+        <table>
+            <tr><th>Nome</th><th>ID</th><th>Mensagens</th><th>Último Acesso</th></tr>
+            {user_rows if user_rows else '<tr><td colspan="4">Nenhum usuário ainda</td></tr>'}
+        </table>
+
+        <h2>📚 Manuais no Banco de Conhecimento</h2>
+        <table>
+            <tr><th>Nome</th><th>Tamanho</th><th>Ação</th></tr>
+            {manual_rows if manual_rows else '<tr><td colspan="3">Nenhum manual carregado</td></tr>'}
+        </table>
+        
+        <div class="upload-form">
+            <h3 style="color:#00d4aa;margin-bottom:10px">📤 Upload de Manual</h3>
+            <form action="/admin/upload" method="POST" enctype="multipart/form-data">
+                <input type="file" name="file" accept=".pdf,.docx,.txt" required>
+                <button type="submit">Enviar Manual</button>
+            </form>
+        </div>
+
+        <h2>⚠️ Erros Recentes</h2>
+        <table>
+            <tr><th>Data/Hora</th><th>Erro</th></tr>
+            {error_rows if error_rows else '<tr><td colspan="2">Nenhum erro registrado</td></tr>'}
+        </table>
+        
+        <p style="margin-top:30px;color:#555;text-align:center">Bot Manutenção v2.3 | <a href="/admin" style="color:#00d4aa">🔄 Atualizar</a></p>
+    </div>
+</body>
+</html>"""
+    return html
+
 class WebhookHandler(BaseHTTPRequestHandler):
     def do_GET(self):
+        path = self.path.split('?')[0]
+        
+        if path == '/admin':
+            if not check_admin_auth(self):
+                send_auth_required(self)
+                return
+            html = get_admin_html()
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/html; charset=utf-8')
+            self.end_headers()
+            self.wfile.write(html.encode('utf-8'))
+            return
+        
+        if path == '/admin/manual/delete':
+            if not check_admin_auth(self):
+                send_auth_required(self)
+                return
+            query = urllib.parse.urlparse(self.path).query
+            params = urllib.parse.parse_qs(query)
+            name = params.get('name', [''])[0]
+            if name:
+                file_path = KNOWLEDGE_DIR / f"{name}.txt"
+                if file_path.exists():
+                    file_path.unlink()
+            self.send_response(302)
+            self.send_header('Location', '/admin')
+            self.end_headers()
+            return
+        
+        if path == '/admin/stats.json':
+            if not check_admin_auth(self):
+                send_auth_required(self)
+                return
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps(_stats, default=str).encode('utf-8'))
+            return
+        
+        # Página padrão
         self.send_response(200)
         self.send_header('Content-Type', 'text/plain')
         self.end_headers()
         self.wfile.write(b'Bot de Manutencao - Online')
 
     def do_POST(self):
+        path = self.path.split('?')[0]
+        
+        # Upload de manual via painel admin
+        if path == '/admin/upload':
+            if not check_admin_auth(self):
+                send_auth_required(self)
+                return
+            try:
+                content_type = self.headers.get('Content-Type', '')
+                if 'multipart/form-data' in content_type:
+                    # Parse multipart
+                    boundary = content_type.split('boundary=')[1].strip()
+                    content_length = int(self.headers.get('Content-Length', 0))
+                    body = self.rfile.read(content_length)
+                    
+                    # Extrair arquivo do multipart
+                    parts = body.split(f'--{boundary}'.encode())
+                    for part in parts:
+                        if b'filename="' in part:
+                            # Extrair nome do arquivo
+                            header_end = part.find(b'\r\n\r\n')
+                            header = part[:header_end].decode('utf-8', errors='ignore')
+                            file_data = part[header_end+4:]
+                            if file_data.endswith(b'\r\n'):
+                                file_data = file_data[:-2]
+                            
+                            # Extrair filename
+                            fname_start = header.find('filename="') + 10
+                            fname_end = header.find('"', fname_start)
+                            filename = header[fname_start:fname_end]
+                            
+                            if filename:
+                                # Salvar temporariamente
+                                tmp_path = f"/tmp/upload_{filename}"
+                                with open(tmp_path, 'wb') as f:
+                                    f.write(file_data)
+                                
+                                # Extrair texto
+                                text = ""
+                                if filename.lower().endswith('.pdf'):
+                                    from PyPDF2 import PdfReader
+                                    reader = PdfReader(tmp_path)
+                                    text = "\n".join([p.extract_text() for p in reader.pages if p.extract_text()])
+                                elif filename.lower().endswith('.docx'):
+                                    from docx import Document as DocxDoc
+                                    doc = DocxDoc(tmp_path)
+                                    text = "\n".join([p.text for p in doc.paragraphs if p.text.strip()])
+                                elif filename.lower().endswith('.txt'):
+                                    with open(tmp_path, 'r', encoding='utf-8', errors='ignore') as f:
+                                        text = f.read()
+                                
+                                if text.strip():
+                                    safe_name = "".join(c if c.isalnum() or c in "._-" else "_" for c in filename)
+                                    save_path = KNOWLEDGE_DIR / f"{safe_name}.txt"
+                                    save_path.write_text(text, encoding='utf-8')
+                                
+                                # Limpar tmp
+                                try:
+                                    os.remove(tmp_path)
+                                except:
+                                    pass
+                            break
+            except Exception as e:
+                logger.error(f"Erro upload admin: {e}")
+            
+            self.send_response(302)
+            self.send_header('Location', '/admin')
+            self.end_headers()
+            return
+        
+        # Webhook do Telegram
+        if path == '/webhook':
+            try:
+                content_length = int(self.headers.get('Content-Length', 0))
+                body = self.rfile.read(content_length)
+                update = json.loads(body.decode('utf-8'))
+                logger.info(f"Webhook update {update.get('update_id', '?')}")
+
+                # Responde 200 imediatamente
+                self.send_response(200)
+                self.send_header('Content-Type', 'text/plain')
+                self.end_headers()
+                self.wfile.write(b'OK')
+
+                # Processa em thread separada para não bloquear
+                t = threading.Thread(target=process_update, args=(update,))
+                t.daemon = True
+                t.start()
+            except Exception as e:
+                logger.error(f"Erro webhook: {e}")
+                self.send_response(500)
+                self.end_headers()
+            return
+        
+        # POST genérico
         try:
             content_length = int(self.headers.get('Content-Length', 0))
             body = self.rfile.read(content_length)
             update = json.loads(body.decode('utf-8'))
-            logger.info(f"Webhook update {update.get('update_id', '?')}")
-
-            # Responde 200 imediatamente
             self.send_response(200)
             self.send_header('Content-Type', 'text/plain')
             self.end_headers()
             self.wfile.write(b'OK')
-
-            # Processa em thread separada para não bloquear
             t = threading.Thread(target=process_update, args=(update,))
             t.daemon = True
             t.start()
         except Exception as e:
-            logger.error(f"Erro webhook: {e}")
+            logger.error(f"Erro POST: {e}")
             self.send_response(500)
             self.end_headers()
 
@@ -919,8 +1306,11 @@ def main():
         logger.error("TELEGRAM_TOKEN não configurado!")
         sys.exit(1)
 
+    # Carregar estatísticas salvas
+    load_stats()
+    
     logger.info("=" * 50)
-    logger.info("BOT MANUTENÇÃO - WEBHOOK MODE v2.0")
+    logger.info("BOT MANUTENÇÃO - WEBHOOK MODE v2.3")
     logger.info(f"Render URL: {RENDER_URL}")
     logger.info(f"Admin ID: {ADMIN_ID}")
     logger.info(f"Groq: {'sim' if GROQ_API_KEY else 'não'}")
@@ -928,6 +1318,7 @@ def main():
     logger.info(f"DeepSeek: {'sim' if DEEPSEEK_API_KEY else 'não'}")
     logger.info(f"Claude: {'sim' if CLAUDE_API_KEY else 'não'}")
     logger.info(f"OpenAI: {'sim' if OPENAI_API_KEY else 'não'}")
+    logger.info(f"Admin Panel: {RENDER_URL}/admin (user: admin)")
     logger.info("=" * 50)
 
     me = telegram_request("getMe")
