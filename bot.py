@@ -18,6 +18,7 @@ from pathlib import Path
 import urllib.request
 import urllib.parse
 import urllib.error
+import re
 
 # --- Configuração via Variáveis de Ambiente ---
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
@@ -58,7 +59,7 @@ FALLBACK_MESSAGE = "Dificuldade em processar todas as solicitações, procure o 
 # Histórico de conversas por chat_id (memória)
 _chat_history = {}  # {chat_id: [{"role": "user", "content": "..."}, {"role": "assistant", "content": "..."}]}
 MAX_HISTORY = 10  # Máximo de pares de mensagens por chat (20 mensagens total)
-HISTORY_TTL = 3600  # 1 hora sem atividade limpa o histórico
+HISTORY_TTL = 7200  # 2 horas sem atividade limpa o histórico
 _chat_last_active = {}  # {chat_id: timestamp}
 
 def add_to_history(chat_id, role, content):
@@ -167,55 +168,64 @@ logger = logging.getLogger(__name__)
 # --- System Prompt ---
 SYSTEM_PROMPT_BASE = (
     "Você é um técnico de manutenção especialista em equipamentos automotivos "
-    "(carros, caminhões, motos) e agrícolas (tratores, colhedoras, pulverizadores, "
-    "plantadeiras, implementos). Responda em português brasileiro.\n\n"
-    "REGRAS (OBRIGATÓRIAS):\n"
-    "1. Seja OBJETIVO e CURTO. Vá direto ao ponto. Nada de introduções longas.\n"
-    "2. Use formato: CAUSA PROVÁVEL → VERIFICAÇÃO → SOLUÇÃO.\n"
-    "3. Cite códigos de peça, torques, especificações técnicas quando souber.\n"
-    "4. Referencie o manual do fabricante (operador ou reparação) quando aplicável.\n"
-    "5. Se receber informações de busca técnica, USE-AS como base da resposta.\n"
-    "6. Máximo 3-4 parágrafos por resposta. Se precisar de mais, pergunte se quer detalhes.\n"
-    "7. Alerte riscos de segurança em UMA linha quando necessário.\n"
-    "8. NÃO repita a pergunta do usuário. NÃO use frases como 'Boa pergunta' ou 'Vou te ajudar'.\n"
-    "9. Comece direto com a informação técnica."
+    "e agrícolas. Responda em português brasileiro.\n\n"
+    "REGRAS OBRIGATÓRIAS:\n"
+    "1. Seja OBJETIVO. Resposta curta e direta. Sem introduções.\n"
+    "2. NUNCA INVENTE dados específicos (horas, torques, pressões, medidas, códigos de peça) "
+    "se não tiver CERTEZA ABSOLUTA. Isso é a regra mais importante.\n"
+    "3. Se NÃO souber o valor exato, diga: 'Não tenho o dado exato para este modelo. "
+    "Consulte o Manual de Reparação [modelo] na seção [sugestão de seção].'\n"
+    "4. Só cite números/especificações se vieram da busca técnica ou do banco de conhecimento.\n"
+    "5. Use formato direto: problema → o que verificar → solução (quando souber).\n"
+    "6. Se receber INFORMAÇÕES DE BUSCA TÉCNICA, use-as como base. Se não receber, "
+    "oriente o usuário sobre onde encontrar (manual, concessionário, seção do manual).\n"
+    "7. Quando o usuário disser que algo está errado, peça a informação correta "
+    "e agradeça a correção.\n"
+    "8. Máximo 3 parágrafos. NÃO repita a pergunta. Comece direto com a resposta.\n"
+    "9. Prefira dizer 'não sei o valor exato' do que chutar um número errado."
 )
 
 # --- Busca Web Técnica ---
 def search_technical_info(query):
     """Busca informações técnicas de fabricantes na web usando DuckDuckGo"""
-    try:
-        # Adicionar termos técnicos à busca
-        search_terms = f"{query} manual técnico operador reparação especificação"
-        encoded = urllib.parse.quote(search_terms)
-        url = f"https://html.duckduckgo.com/html/?q={encoded}"
-        
-        req = urllib.request.Request(url, headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        })
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            html = resp.read().decode("utf-8", errors="ignore")
-        
-        # Extrair snippets dos resultados
-        results = []
-        import re
-        # Pegar os snippets de resultado
-        snippets = re.findall(r'<a class="result__snippet"[^>]*>(.*?)</a>', html, re.DOTALL)
-        titles = re.findall(r'<a class="result__a"[^>]*>(.*?)</a>', html, re.DOTALL)
-        
-        for i, (title, snippet) in enumerate(zip(titles[:5], snippets[:5])):
-            # Limpar HTML tags
-            clean_title = re.sub(r'<[^>]+>', '', title).strip()
-            clean_snippet = re.sub(r'<[^>]+>', '', snippet).strip()
-            if clean_title and clean_snippet:
-                results.append(f"• {clean_title}: {clean_snippet}")
-        
-        if results:
-            return "\n".join(results)
-        return None
-    except Exception as e:
-        logger.warning(f"Busca web falhou: {e}")
-        return None
+    
+    # Fazer duas buscas: uma específica e uma mais geral
+    all_results = []
+    
+    search_variants = [
+        f"{query} manual reparação especificação técnica",
+        f"{query} service manual specifications",
+    ]
+    
+    for search_terms in search_variants:
+        try:
+            encoded = urllib.parse.quote(search_terms)
+            url = f"https://html.duckduckgo.com/html/?q={encoded}"
+            
+            req = urllib.request.Request(url, headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            })
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                html = resp.read().decode("utf-8", errors="ignore")
+            
+            # Extrair snippets dos resultados
+            snippets = re.findall(r'<a class="result__snippet"[^>]*>(.*?)</a>', html, re.DOTALL)
+            titles = re.findall(r'<a class="result__a"[^>]*>(.*?)</a>', html, re.DOTALL)
+            
+            for title, snippet in zip(titles[:4], snippets[:4]):
+                clean_title = re.sub(r'<[^>]+>', '', title).strip()
+                clean_snippet = re.sub(r'<[^>]+>', '', snippet).strip()
+                if clean_title and clean_snippet and len(clean_snippet) > 30:
+                    all_results.append(f"• {clean_title}: {clean_snippet}")
+        except Exception as e:
+            logger.warning(f"Busca web falhou para '{search_terms[:30]}': {e}")
+            continue
+    
+    if all_results:
+        # Remover duplicatas
+        unique = list(dict.fromkeys(all_results))
+        return "\n".join(unique[:6])
+    return None
 
 def detect_equipment_query(text):
     """Detecta se a mensagem menciona equipamento/marca específica que vale buscar"""
