@@ -166,22 +166,90 @@ logger = logging.getLogger(__name__)
 
 # --- System Prompt ---
 SYSTEM_PROMPT_BASE = (
-    "Você é um mecânico e técnico de manutenção altamente experiente, "
-    "especializado em equipamentos automotivos (carros, caminhões, motos) "
-    "e de agricultura (tratores, colhedoras, pulverizadores, plantadeiras, etc). "
-    "Responda SEMPRE em português brasileiro.\n\n"
-    "REGRAS PARA SUAS RESPOSTAS:\n"
-    "1. Seja PRÁTICO e DIRETO. Dê passos numerados de diagnóstico e reparo.\n"
-    "2. Comece identificando as causas mais prováveis do problema.\n"
-    "3. Para cada causa, explique como verificar e como resolver.\n"
-    "4. Inclua ferramentas necessárias quando relevante.\n"
-    "5. Indique peças que podem precisar ser trocadas com nomes técnicos.\n"
-    "6. Alerte sobre riscos de segurança quando houver.\n"
-    "7. Se houver informações dos manuais no banco de conhecimento, "
-    "PRIORIZE essas informações e cite o manual de referência.\n"
-    "8. Use linguagem técnica mas acessível.\n"
-    "9. Quando o problema puder ser grave, recomende levar a um profissional."
+    "Você é um técnico de manutenção especialista em equipamentos automotivos "
+    "(carros, caminhões, motos) e agrícolas (tratores, colhedoras, pulverizadores, "
+    "plantadeiras, implementos). Responda em português brasileiro.\n\n"
+    "REGRAS (OBRIGATÓRIAS):\n"
+    "1. Seja OBJETIVO e CURTO. Vá direto ao ponto. Nada de introduções longas.\n"
+    "2. Use formato: CAUSA PROVÁVEL → VERIFICAÇÃO → SOLUÇÃO.\n"
+    "3. Cite códigos de peça, torques, especificações técnicas quando souber.\n"
+    "4. Referencie o manual do fabricante (operador ou reparação) quando aplicável.\n"
+    "5. Se receber informações de busca técnica, USE-AS como base da resposta.\n"
+    "6. Máximo 3-4 parágrafos por resposta. Se precisar de mais, pergunte se quer detalhes.\n"
+    "7. Alerte riscos de segurança em UMA linha quando necessário.\n"
+    "8. NÃO repita a pergunta do usuário. NÃO use frases como 'Boa pergunta' ou 'Vou te ajudar'.\n"
+    "9. Comece direto com a informação técnica."
 )
+
+# --- Busca Web Técnica ---
+def search_technical_info(query):
+    """Busca informações técnicas de fabricantes na web usando DuckDuckGo"""
+    try:
+        # Adicionar termos técnicos à busca
+        search_terms = f"{query} manual técnico operador reparação especificação"
+        encoded = urllib.parse.quote(search_terms)
+        url = f"https://html.duckduckgo.com/html/?q={encoded}"
+        
+        req = urllib.request.Request(url, headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        })
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            html = resp.read().decode("utf-8", errors="ignore")
+        
+        # Extrair snippets dos resultados
+        results = []
+        import re
+        # Pegar os snippets de resultado
+        snippets = re.findall(r'<a class="result__snippet"[^>]*>(.*?)</a>', html, re.DOTALL)
+        titles = re.findall(r'<a class="result__a"[^>]*>(.*?)</a>', html, re.DOTALL)
+        
+        for i, (title, snippet) in enumerate(zip(titles[:5], snippets[:5])):
+            # Limpar HTML tags
+            clean_title = re.sub(r'<[^>]+>', '', title).strip()
+            clean_snippet = re.sub(r'<[^>]+>', '', snippet).strip()
+            if clean_title and clean_snippet:
+                results.append(f"• {clean_title}: {clean_snippet}")
+        
+        if results:
+            return "\n".join(results)
+        return None
+    except Exception as e:
+        logger.warning(f"Busca web falhou: {e}")
+        return None
+
+def detect_equipment_query(text):
+    """Detecta se a mensagem menciona equipamento/marca específica que vale buscar"""
+    text_lower = text.lower()
+    
+    # Marcas e fabricantes
+    brands = [
+        "john deere", "case", "new holland", "massey ferguson", "valtra",
+        "fendt", "claas", "kubota", "yanmar", "agrale", "stara", "jacto",
+        "caterpillar", "cat", "komatsu", "volvo", "scania", "mercedes",
+        "iveco", "ford", "volkswagen", "vw", "toyota", "mitsubishi",
+        "cummins", "perkins", "mwm", "deutz", "sisu", "fpt",
+        "bosch", "denso", "delphi", "rexroth", "parker", "danfoss",
+        "zf", "dana", "carraro", "eaton", "allison",
+        "baldan", "marchesan", "tatu", "jumil", "semeato", "sfil",
+        "husqvarna", "stihl", "honda", "briggs", "kohler",
+    ]
+    
+    # Termos técnicos que indicam necessidade de busca
+    tech_terms = [
+        "código de erro", "código falha", "dtc", "alarme",
+        "torque", "especificação", "regulagem", "calibração",
+        "intervalo manutenção", "troca de óleo", "filtro",
+        "pressão", "vazão", "rpm", "horímetro",
+        "esquema elétrico", "diagrama", "fusível",
+        "peça", "part number", "referência",
+        "manual", "procedimento",
+    ]
+    
+    has_brand = any(b in text_lower for b in brands)
+    has_tech = any(t in text_lower for t in tech_terms)
+    
+    # Buscar se tem marca OU se tem termo técnico específico
+    return has_brand or has_tech
 
 # --- Telegram API ---
 def telegram_request(method, data=None, timeout=60):
@@ -553,20 +621,26 @@ def load_knowledge_base():
                 pass
     return "\n\n---\n\n".join(texts) if texts else ""
 
-def build_system_prompt():
-    """Constrói o system prompt com base de conhecimento"""
+def build_system_prompt(web_info=None):
+    """Constrói o system prompt com base de conhecimento e busca web"""
     knowledge = load_knowledge_base()
     prompt = SYSTEM_PROMPT_BASE
     if knowledge:
         prompt += (
-            "\n\n=== INFORMAÇÕES DOS MANUAIS (PRIORIDADE MÁXIMA) ===\n"
+            "\n\n=== INFORMAÇÕES DOS MANUAIS CARREGADOS (PRIORIDADE MÁXIMA) ===\n"
             + knowledge[:4000]
+        )
+    if web_info:
+        prompt += (
+            "\n\n=== INFORMAÇÕES TÉCNICAS ENCONTRADAS NA WEB (USE COMO REFERÊNCIA) ===\n"
+            + web_info[:3000]
+            + "\n\nUse estas informações para embasar sua resposta. Cite a fonte quando possível."
         )
     return prompt
 
-def build_messages_with_history(chat_id, user_text):
+def build_messages_with_history(chat_id, user_text, web_info=None):
     """Constrói lista de mensagens com histórico para APIs OpenAI-compatible"""
-    system_prompt = build_system_prompt()
+    system_prompt = build_system_prompt(web_info)
     messages = [{"role": "system", "content": system_prompt}]
     
     # Adiciona histórico anterior
@@ -578,9 +652,9 @@ def build_messages_with_history(chat_id, user_text):
     messages.append({"role": "user", "content": user_text})
     return messages
 
-def build_gemini_prompt_with_history(chat_id, user_text):
+def build_gemini_prompt_with_history(chat_id, user_text, web_info=None):
     """Constrói prompt concatenado com histórico para Gemini"""
-    system_prompt = build_system_prompt()
+    system_prompt = build_system_prompt(web_info)
     prompt = system_prompt
     
     # Adiciona histórico como contexto
@@ -813,9 +887,17 @@ def handle_text(chat_id, text):
     logger.info(f"Texto de {chat_id}: {text[:80]}")
     send_typing(chat_id)
     
-    # Construir mensagens com histórico
-    messages = build_messages_with_history(chat_id, text)
-    gemini_prompt = build_gemini_prompt_with_history(chat_id, text)
+    # Busca web técnica se detectar equipamento/marca/termo técnico
+    web_info = None
+    if detect_equipment_query(text):
+        logger.info(f"Busca técnica ativada para: {text[:50]}")
+        web_info = search_technical_info(text)
+        if web_info:
+            logger.info(f"Busca retornou {len(web_info)} chars")
+    
+    # Construir mensagens com histórico + info da web
+    messages = build_messages_with_history(chat_id, text, web_info)
+    gemini_prompt = build_gemini_prompt_with_history(chat_id, text, web_info)
     
     reply = call_ai_with_fallback(messages, gemini_prompt)
     
@@ -844,9 +926,14 @@ def handle_voice(chat_id, voice_or_audio):
         send_message(chat_id, f"🎤 Entendi: \"{transcribed}\"\n\nProcessando resposta...")
         send_typing(chat_id)
         
-        # Construir mensagens com histórico
-        messages = build_messages_with_history(chat_id, transcribed)
-        gemini_prompt = build_gemini_prompt_with_history(chat_id, transcribed)
+        # Busca web técnica se detectar equipamento
+        web_info = None
+        if detect_equipment_query(transcribed):
+            web_info = search_technical_info(transcribed)
+        
+        # Construir mensagens com histórico + info da web
+        messages = build_messages_with_history(chat_id, transcribed, web_info)
+        gemini_prompt = build_gemini_prompt_with_history(chat_id, transcribed, web_info)
         
         reply = call_ai_with_fallback(messages, gemini_prompt)
         
