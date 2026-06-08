@@ -170,93 +170,212 @@ SYSTEM_PROMPT_BASE = (
     "Você é um técnico de manutenção especialista em equipamentos automotivos "
     "e agrícolas. Responda em português brasileiro.\n\n"
     "REGRAS OBRIGATÓRIAS:\n"
-    "1. Seja OBJETIVO. Resposta curta e direta. Sem introduções.\n"
+    "1. Seja OBJETIVO. Resposta curta e direta. Sem introduções ou saudações.\n"
     "2. NUNCA INVENTE dados específicos (horas, torques, pressões, medidas, códigos de peça) "
-    "se não tiver CERTEZA ABSOLUTA. Isso é a regra mais importante.\n"
-    "3. Se NÃO souber o valor exato, diga: 'Não tenho o dado exato para este modelo. "
-    "Consulte o Manual de Reparação [modelo] na seção [sugestão de seção].'\n"
-    "4. Só cite números/especificações se vieram da busca técnica ou do banco de conhecimento.\n"
-    "5. Use formato direto: problema → o que verificar → solução (quando souber).\n"
-    "6. Se receber INFORMAÇÕES DE BUSCA TÉCNICA, use-as como base. Se não receber, "
-    "oriente o usuário sobre onde encontrar (manual, concessionário, seção do manual).\n"
-    "7. Quando o usuário disser que algo está errado, peça a informação correta "
-    "e agradeça a correção.\n"
-    "8. Máximo 3 parágrafos. NÃO repita a pergunta. Comece direto com a resposta.\n"
-    "9. Prefira dizer 'não sei o valor exato' do que chutar um número errado."
+    "se não tiver CERTEZA ABSOLUTA baseada nas informações fornecidas.\n"
+    "3. Se receber INFORMAÇÕES DE BUSCA TÉCNICA ou CONTEÚDO DE MANUAIS, "
+    "USE-OS como fonte primária. Extraia dados específicos de lá.\n"
+    "4. Se NÃO encontrou o dado exato nas fontes fornecidas, diga claramente: "
+    "'Não localizei este dado específico. Consulte o Manual de Reparação/Operador "
+    "[modelo], seção [sugestão].' NÃO invente.\n"
+    "5. Formato: resposta direta com dados técnicos → onde verificar → observação se necessário.\n"
+    "6. Quando o usuário corrigir algo, agradeça e peça mais detalhes se útil.\n"
+    "7. Máximo 3-4 parágrafos. Se a resposta precisar ser longa, pergunte se quer mais detalhes.\n"
+    "8. Cite a fonte quando usar dados da busca (ex: 'Conforme manual do fabricante...').\n"
+    "9. Prefira dizer 'não localizei' do que inventar um valor."
 )
 
-# --- Busca Web Técnica ---
-def search_technical_info(query):
-    """Busca informações técnicas de fabricantes na web usando DuckDuckGo"""
+# --- Busca Web Técnica Avançada ---
+
+# Marcas e fabricantes reconhecidos
+BRANDS = [
+    "john deere", "case", "case ih", "new holland", "massey ferguson", "valtra",
+    "fendt", "claas", "kubota", "yanmar", "agrale", "stara", "jacto",
+    "caterpillar", "cat", "komatsu", "volvo", "scania", "mercedes",
+    "iveco", "ford", "volkswagen", "vw", "toyota", "mitsubishi",
+    "cummins", "perkins", "mwm", "deutz", "sisu", "fpt",
+    "bosch", "denso", "delphi", "rexroth", "parker", "danfoss",
+    "zf", "dana", "carraro", "eaton", "allison",
+    "baldan", "marchesan", "tatu", "jumil", "semeato", "sfil",
+    "husqvarna", "stihl", "honda", "briggs", "kohler",
+    "ls tractor", "mahindra", "landini", "deutz-fahr", "same",
+]
+
+# Termos técnicos que indicam necessidade de busca
+TECH_TERMS = [
+    "código de erro", "código falha", "dtc", "alarme", "erro",
+    "torque", "especificação", "regulagem", "calibração", "ajuste",
+    "intervalo", "manutenção", "troca de óleo", "filtro", "lubrificação",
+    "pressão", "vazão", "rpm", "horímetro", "temperatura",
+    "esquema elétrico", "diagrama", "fusível", "relé", "sensor",
+    "peça", "part number", "referência", "número",
+    "manual", "procedimento", "reparação", "desmontagem", "montagem",
+    "válvula", "bomba", "injetor", "turbo", "embreagem", "freio",
+    "hidráulico", "transmissão", "diferencial", "eixo",
+    "motor", "cabeçote", "pistão", "biela", "virabrequim",
+    "colhedora", "trator", "pulverizador", "plantadeira",
+]
+
+def extract_brand_model(text):
+    """Extrai marca e modelo da mensagem do usuário"""
+    text_lower = text.lower()
+    found_brand = None
+    found_model = None
     
-    # Fazer duas buscas: uma específica e uma mais geral
+    for brand in BRANDS:
+        if brand in text_lower:
+            found_brand = brand
+            break
+    
+    # Tentar extrair modelo (números e letras após a marca)
+    if found_brand:
+        # Procurar padrões como "CH 570", "7200J", "MF 4275", "CR 9080"
+        patterns = [
+            r'(?:' + re.escape(found_brand) + r')\s*([a-zA-Z]*\s*\d+[a-zA-Z]*(?:\s*\d+)*)',
+            r'([A-Z]{1,4}\s*\d{2,5}[A-Z]?(?:\s*\d{4})?)',  # CH 570 2025, 7200J
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                found_model = match.group(1).strip()
+                break
+    
+    return found_brand, found_model
+
+def do_web_search(search_terms, timeout=8):
+    """Executa uma busca no DuckDuckGo e retorna resultados limpos"""
+    results = []
+    try:
+        encoded = urllib.parse.quote(search_terms)
+        url = f"https://html.duckduckgo.com/html/?q={encoded}"
+        
+        req = urllib.request.Request(url, headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml",
+            "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
+        })
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            html = resp.read().decode("utf-8", errors="ignore")
+        
+        snippets = re.findall(r'<a class="result__snippet"[^>]*>(.*?)</a>', html, re.DOTALL)
+        titles = re.findall(r'<a class="result__a"[^>]*>(.*?)</a>', html, re.DOTALL)
+        urls = re.findall(r'<a class="result__url"[^>]*href="([^"]+)"', html)
+        
+        for i, (title, snippet) in enumerate(zip(titles[:5], snippets[:5])):
+            clean_title = re.sub(r'<[^>]+>', '', title).strip()
+            clean_snippet = re.sub(r'<[^>]+>', '', snippet).strip()
+            if clean_title and clean_snippet and len(clean_snippet) > 20:
+                source = urls[i] if i < len(urls) else ""
+                results.append({
+                    "title": clean_title,
+                    "snippet": clean_snippet,
+                    "url": source,
+                })
+    except Exception as e:
+        logger.warning(f"Busca falhou: {e}")
+    return results
+
+def fetch_page_content(url, max_chars=3000):
+    """Tenta acessar uma página web e extrair conteúdo textual relevante"""
+    try:
+        req = urllib.request.Request(url, headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        })
+        with urllib.request.urlopen(req, timeout=6) as resp:
+            content_type = resp.headers.get('Content-Type', '')
+            if 'text/html' not in content_type:
+                return None
+            html = resp.read(50000).decode("utf-8", errors="ignore")
+        
+        # Remover scripts, styles, nav
+        html = re.sub(r'<script[^>]*>.*?</script>', '', html, flags=re.DOTALL)
+        html = re.sub(r'<style[^>]*>.*?</style>', '', html, flags=re.DOTALL)
+        html = re.sub(r'<nav[^>]*>.*?</nav>', '', html, flags=re.DOTALL)
+        html = re.sub(r'<header[^>]*>.*?</header>', '', html, flags=re.DOTALL)
+        html = re.sub(r'<footer[^>]*>.*?</footer>', '', html, flags=re.DOTALL)
+        
+        # Extrair texto
+        text = re.sub(r'<[^>]+>', ' ', html)
+        text = re.sub(r'\s+', ' ', text).strip()
+        
+        # Filtrar conteúdo muito curto
+        if len(text) < 100:
+            return None
+        
+        return text[:max_chars]
+    except:
+        return None
+
+def search_technical_info(query):
+    """Busca avançada de informações técnicas - múltiplas fontes"""
+    brand, model = extract_brand_model(query)
     all_results = []
     
-    search_variants = [
-        f"{query} manual reparação especificação técnica",
-        f"{query} service manual specifications",
-    ]
+    # Montar buscas específicas baseadas na marca/modelo
+    search_queries = []
     
-    for search_terms in search_variants:
-        try:
-            encoded = urllib.parse.quote(search_terms)
-            url = f"https://html.duckduckgo.com/html/?q={encoded}"
-            
-            req = urllib.request.Request(url, headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            })
-            with urllib.request.urlopen(req, timeout=8) as resp:
-                html = resp.read().decode("utf-8", errors="ignore")
-            
-            # Extrair snippets dos resultados
-            snippets = re.findall(r'<a class="result__snippet"[^>]*>(.*?)</a>', html, re.DOTALL)
-            titles = re.findall(r'<a class="result__a"[^>]*>(.*?)</a>', html, re.DOTALL)
-            
-            for title, snippet in zip(titles[:4], snippets[:4]):
-                clean_title = re.sub(r'<[^>]+>', '', title).strip()
-                clean_snippet = re.sub(r'<[^>]+>', '', snippet).strip()
-                if clean_title and clean_snippet and len(clean_snippet) > 30:
-                    all_results.append(f"• {clean_title}: {clean_snippet}")
-        except Exception as e:
-            logger.warning(f"Busca web falhou para '{search_terms[:30]}': {e}")
-            continue
+    if brand and model:
+        # Buscas muito específicas
+        search_queries.append(f"{brand} {model} manual reparação {query}")
+        search_queries.append(f"{brand} {model} service manual repair")
+        search_queries.append(f"{brand} {model} operator manual specifications")
+    elif brand:
+        search_queries.append(f"{brand} {query} manual técnico")
+        search_queries.append(f"{brand} {query} repair manual")
+    else:
+        search_queries.append(f"{query} manual técnico reparação")
+        search_queries.append(f"{query} technical service manual")
     
-    if all_results:
-        # Remover duplicatas
-        unique = list(dict.fromkeys(all_results))
-        return "\n".join(unique[:6])
-    return None
+    # Executar buscas
+    seen_snippets = set()
+    for sq in search_queries[:3]:
+        results = do_web_search(sq)
+        for r in results:
+            # Evitar duplicatas
+            key = r["snippet"][:50]
+            if key not in seen_snippets:
+                seen_snippets.add(key)
+                all_results.append(r)
+    
+    if not all_results:
+        return None
+    
+    # Tentar acessar a página mais relevante para obter mais detalhes
+    page_content = None
+    for r in all_results[:2]:
+        url = r.get("url", "")
+        if url and not any(x in url for x in [".pdf", "youtube", "facebook", "instagram"]):
+            # Resolver URL do DuckDuckGo redirect
+            if "duckduckgo.com" in url:
+                parsed = urllib.parse.urlparse(url)
+                params = urllib.parse.parse_qs(parsed.query)
+                url = params.get("uddg", [url])[0]
+            
+            content = fetch_page_content(url)
+            if content and len(content) > 200:
+                page_content = content
+                break
+    
+    # Montar resultado final
+    output_parts = []
+    
+    # Snippets dos resultados de busca
+    output_parts.append("RESULTADOS DE BUSCA:")
+    for r in all_results[:5]:
+        output_parts.append(f"• {r['title']}: {r['snippet']}")
+    
+    # Conteúdo da página acessada
+    if page_content:
+        output_parts.append(f"\nCONTEÚDO DETALHADO DA FONTE:\n{page_content}")
+    
+    return "\n".join(output_parts)
 
 def detect_equipment_query(text):
     """Detecta se a mensagem menciona equipamento/marca específica que vale buscar"""
     text_lower = text.lower()
     
-    # Marcas e fabricantes
-    brands = [
-        "john deere", "case", "new holland", "massey ferguson", "valtra",
-        "fendt", "claas", "kubota", "yanmar", "agrale", "stara", "jacto",
-        "caterpillar", "cat", "komatsu", "volvo", "scania", "mercedes",
-        "iveco", "ford", "volkswagen", "vw", "toyota", "mitsubishi",
-        "cummins", "perkins", "mwm", "deutz", "sisu", "fpt",
-        "bosch", "denso", "delphi", "rexroth", "parker", "danfoss",
-        "zf", "dana", "carraro", "eaton", "allison",
-        "baldan", "marchesan", "tatu", "jumil", "semeato", "sfil",
-        "husqvarna", "stihl", "honda", "briggs", "kohler",
-    ]
-    
-    # Termos técnicos que indicam necessidade de busca
-    tech_terms = [
-        "código de erro", "código falha", "dtc", "alarme",
-        "torque", "especificação", "regulagem", "calibração",
-        "intervalo manutenção", "troca de óleo", "filtro",
-        "pressão", "vazão", "rpm", "horímetro",
-        "esquema elétrico", "diagrama", "fusível",
-        "peça", "part number", "referência",
-        "manual", "procedimento",
-    ]
-    
-    has_brand = any(b in text_lower for b in brands)
-    has_tech = any(t in text_lower for t in tech_terms)
+    has_brand = any(b in text_lower for b in BRANDS)
+    has_tech = any(t in text_lower for t in TECH_TERMS)
     
     # Buscar se tem marca OU se tem termo técnico específico
     return has_brand or has_tech
