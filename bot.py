@@ -44,7 +44,7 @@ DEEPSEEK_MODEL = "deepseek-chat"
 DEEPSEEK_BASE_URL = "https://api.deepseek.com/v1"
 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
-GROQ_MODEL = "llama-3.3-70b-versatile"
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
 GROQ_BASE_URL = "https://api.groq.com/openai/v1"
 
 KNOWLEDGE_DIR = Path("/tmp/knowledge_base")
@@ -168,21 +168,24 @@ logger = logging.getLogger(__name__)
 # --- System Prompt ---
 SYSTEM_PROMPT_BASE = (
     "Você é um técnico de manutenção especialista em equipamentos automotivos "
-    "e agrícolas. Responda em português brasileiro.\n\n"
+    "e agrícolas com acesso a busca na internet. Responda em português brasileiro.\n\n"
+    "VOCÊ TEM ACESSO A INFORMAÇÕES DA INTERNET. Quando receber dados de busca técnica, "
+    "USE-OS na resposta. NUNCA diga que 'não tem acesso' a informações.\n\n"
     "REGRAS OBRIGATÓRIAS:\n"
-    "1. Seja OBJETIVO. Resposta curta e direta. Sem introduções ou saudações.\n"
-    "2. NUNCA INVENTE dados específicos (horas, torques, pressões, medidas, códigos de peça) "
-    "se não tiver CERTEZA ABSOLUTA baseada nas informações fornecidas.\n"
-    "3. Se receber INFORMAÇÕES DE BUSCA TÉCNICA ou CONTEÚDO DE MANUAIS, "
-    "USE-OS como fonte primária. Extraia dados específicos de lá.\n"
-    "4. Se NÃO encontrou o dado exato nas fontes fornecidas, diga claramente: "
-    "'Não localizei este dado específico. Consulte o Manual de Reparação/Operador "
-    "[modelo], seção [sugestão].' NÃO invente.\n"
-    "5. Formato: resposta direta com dados técnicos → onde verificar → observação se necessário.\n"
-    "6. Quando o usuário corrigir algo, agradeça e peça mais detalhes se útil.\n"
-    "7. Máximo 3-4 parágrafos. Se a resposta precisar ser longa, pergunte se quer mais detalhes.\n"
-    "8. Cite a fonte quando usar dados da busca (ex: 'Conforme manual do fabricante...').\n"
-    "9. Prefira dizer 'não localizei' do que inventar um valor."
+    "1. OBJETIVO e DIRETO. Sem introduções, saudações ou enrolação.\n"
+    "2. Se receber INFORMAÇÕES DE BUSCA TÉCNICA abaixo, USE-AS como base da resposta. "
+    "Extraia os dados relevantes e apresente de forma clara.\n"
+    "3. NUNCA INVENTE números específicos (horas, torques, pressões, medidas). "
+    "Só cite valores que estão EXPLICITAMENTE nas informações fornecidas.\n"
+    "4. Se o dado específico NÃO está nas informações fornecidas, diga: "
+    "'Não localizei este dado específico nas fontes disponíveis. "
+    "Recomendo consultar o Manual de Reparação/Operador do [modelo], seção [sugestão].'\n"
+    "5. NUNCA diga 'não tenho acesso' ou 'não posso acessar sites'. "
+    "Você TEM acesso via busca automática.\n"
+    "6. Formato: dado técnico direto → fonte → observação se necessário.\n"
+    "7. Quando o usuário corrigir algo, agradeça e registre.\n"
+    "8. Máximo 3-4 parágrafos.\n"
+    "9. Use seu conhecimento técnico geral para contextualizar, mas não invente valores."
 )
 
 # --- Busca Web Técnica Avançada ---
@@ -243,7 +246,14 @@ def extract_brand_model(text):
     return found_brand, found_model
 
 def do_web_search(search_terms, timeout=8):
-    """Executa uma busca no DuckDuckGo e retorna resultados limpos"""
+    """Executa busca web - tenta DuckDuckGo e Google como fallback"""
+    results = _search_duckduckgo(search_terms, timeout)
+    if not results:
+        results = _search_google(search_terms, timeout)
+    return results
+
+def _search_duckduckgo(search_terms, timeout=8):
+    """Busca via DuckDuckGo HTML"""
     results = []
     try:
         encoded = urllib.parse.quote(search_terms)
@@ -272,7 +282,43 @@ def do_web_search(search_terms, timeout=8):
                     "url": source,
                 })
     except Exception as e:
-        logger.warning(f"Busca falhou: {e}")
+        logger.warning(f"DuckDuckGo falhou: {e}")
+    return results
+
+def _search_google(search_terms, timeout=8):
+    """Busca via Google (scraping básico como fallback)"""
+    results = []
+    try:
+        encoded = urllib.parse.quote(search_terms)
+        url = f"https://www.google.com/search?q={encoded}&hl=pt-BR&num=5"
+        
+        req = urllib.request.Request(url, headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml",
+            "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
+        })
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            html = resp.read().decode("utf-8", errors="ignore")
+        
+        # Extrair blocos de resultado do Google
+        blocks = re.findall(r'<div class="[^"]*"[^>]*>.*?</div>', html[:50000], re.DOTALL)
+        
+        # Tentar extrair texto útil
+        text_content = re.sub(r'<[^>]+>', ' ', html[:30000])
+        text_content = re.sub(r'\s+', ' ', text_content)
+        
+        # Extrair frases que parecem resultados (entre pontos, com mais de 50 chars)
+        sentences = re.findall(r'([A-ZÀ-Ü][^.!?]{50,200}[.!?])', text_content)
+        for s in sentences[:5]:
+            s = s.strip()
+            if len(s) > 50 and not any(x in s.lower() for x in ['google', 'cookie', 'privacy', 'javascript']):
+                results.append({
+                    "title": "Google",
+                    "snippet": s,
+                    "url": "",
+                })
+    except Exception as e:
+        logger.warning(f"Google falhou: {e}")
     return results
 
 def fetch_page_content(url, max_chars=3000):
@@ -307,7 +353,7 @@ def fetch_page_content(url, max_chars=3000):
         return None
 
 def search_technical_info(query):
-    """Busca avançada de informações técnicas - múltiplas fontes"""
+    """Busca avançada de informações técnicas - múltiplas fontes e estratégias"""
     brand, model = extract_brand_model(query)
     all_results = []
     
@@ -315,23 +361,24 @@ def search_technical_info(query):
     search_queries = []
     
     if brand and model:
-        # Buscas muito específicas
-        search_queries.append(f"{brand} {model} manual reparação {query}")
-        search_queries.append(f"{brand} {model} service manual repair")
-        search_queries.append(f"{brand} {model} operator manual specifications")
+        # Buscas muito específicas para o modelo
+        search_queries.append(f"{brand} {model} especificações técnicas motor")
+        search_queries.append(f"{brand} {model} manual reparação")
+        search_queries.append(f"{brand} {model} service manual specifications")
+        search_queries.append(f"{brand} {model} ficha técnica")
     elif brand:
-        search_queries.append(f"{brand} {query} manual técnico")
-        search_queries.append(f"{brand} {query} repair manual")
+        search_queries.append(f"{brand} {query}")
+        search_queries.append(f"{brand} {query} manual técnico especificações")
+        search_queries.append(f"{brand} {query} repair service")
     else:
-        search_queries.append(f"{query} manual técnico reparação")
-        search_queries.append(f"{query} technical service manual")
+        search_queries.append(f"{query} especificações técnicas")
+        search_queries.append(f"{query} manual reparação")
     
-    # Executar buscas
+    # Executar buscas (até 4 queries)
     seen_snippets = set()
-    for sq in search_queries[:3]:
+    for sq in search_queries[:4]:
         results = do_web_search(sq)
         for r in results:
-            # Evitar duplicatas
             key = r["snippet"][:50]
             if key not in seen_snippets:
                 seen_snippets.add(key)
@@ -340,35 +387,42 @@ def search_technical_info(query):
     if not all_results:
         return None
     
-    # Tentar acessar a página mais relevante para obter mais detalhes
-    page_content = None
-    for r in all_results[:2]:
+    # Tentar acessar até 2 páginas relevantes para obter mais detalhes
+    page_contents = []
+    accessed = 0
+    for r in all_results[:4]:
+        if accessed >= 2:
+            break
         url = r.get("url", "")
-        if url and not any(x in url for x in [".pdf", "youtube", "facebook", "instagram"]):
+        if url and not any(x in url for x in [".pdf", "youtube", "facebook", "instagram", "twitter"]):
             # Resolver URL do DuckDuckGo redirect
             if "duckduckgo.com" in url:
                 parsed = urllib.parse.urlparse(url)
                 params = urllib.parse.parse_qs(parsed.query)
                 url = params.get("uddg", [url])[0]
             
-            content = fetch_page_content(url)
+            content = fetch_page_content(url, max_chars=2500)
             if content and len(content) > 200:
-                page_content = content
-                break
+                page_contents.append(f"Fonte: {r['title']}\n{content}")
+                accessed += 1
     
     # Montar resultado final
     output_parts = []
     
     # Snippets dos resultados de busca
-    output_parts.append("RESULTADOS DE BUSCA:")
-    for r in all_results[:5]:
+    output_parts.append("RESULTADOS DE BUSCA (use estes dados na resposta):")
+    for r in all_results[:6]:
         output_parts.append(f"• {r['title']}: {r['snippet']}")
     
-    # Conteúdo da página acessada
-    if page_content:
-        output_parts.append(f"\nCONTEÚDO DETALHADO DA FONTE:\n{page_content}")
+    # Conteúdo das páginas acessadas
+    if page_contents:
+        output_parts.append("\nCONTEÚDO DETALHADO DAS FONTES (dados confiáveis):")
+        for pc in page_contents:
+            output_parts.append(pc)
     
-    return "\n".join(output_parts)
+    result = "\n".join(output_parts)
+    logger.info(f"Busca técnica: {len(all_results)} resultados, {len(page_contents)} páginas acessadas")
+    return result
 
 def detect_equipment_query(text):
     """Detecta se a mensagem menciona equipamento/marca específica que vale buscar"""
@@ -750,8 +804,8 @@ def load_knowledge_base():
                 pass
     return "\n\n---\n\n".join(texts) if texts else ""
 
-def build_system_prompt(web_info=None):
-    """Constrói o system prompt com base de conhecimento e busca web"""
+def build_system_prompt():
+    """Constrói o system prompt com base de conhecimento"""
     knowledge = load_knowledge_base()
     prompt = SYSTEM_PROMPT_BASE
     if knowledge:
@@ -759,17 +813,11 @@ def build_system_prompt(web_info=None):
             "\n\n=== INFORMAÇÕES DOS MANUAIS CARREGADOS (PRIORIDADE MÁXIMA) ===\n"
             + knowledge[:4000]
         )
-    if web_info:
-        prompt += (
-            "\n\n=== INFORMAÇÕES TÉCNICAS ENCONTRADAS NA WEB (USE COMO REFERÊNCIA) ===\n"
-            + web_info[:3000]
-            + "\n\nUse estas informações para embasar sua resposta. Cite a fonte quando possível."
-        )
     return prompt
 
 def build_messages_with_history(chat_id, user_text, web_info=None):
     """Constrói lista de mensagens com histórico para APIs OpenAI-compatible"""
-    system_prompt = build_system_prompt(web_info)
+    system_prompt = build_system_prompt()
     messages = [{"role": "system", "content": system_prompt}]
     
     # Adiciona histórico anterior
@@ -777,13 +825,21 @@ def build_messages_with_history(chat_id, user_text, web_info=None):
     for msg in history:
         messages.append(msg)
     
-    # Adiciona mensagem atual
-    messages.append({"role": "user", "content": user_text})
+    # Adiciona mensagem atual COM as informações de busca embutidas
+    if web_info:
+        enriched_text = (
+            f"{user_text}\n\n"
+            f"[INFORMAÇÕES TÉCNICAS ENCONTRADAS - USE ESTES DADOS NA SUA RESPOSTA]:\n"
+            f"{web_info[:4000]}"
+        )
+        messages.append({"role": "user", "content": enriched_text})
+    else:
+        messages.append({"role": "user", "content": user_text})
     return messages
 
 def build_gemini_prompt_with_history(chat_id, user_text, web_info=None):
     """Constrói prompt concatenado com histórico para Gemini"""
-    system_prompt = build_system_prompt(web_info)
+    system_prompt = build_system_prompt()
     prompt = system_prompt
     
     # Adiciona histórico como contexto
@@ -794,7 +850,15 @@ def build_gemini_prompt_with_history(chat_id, user_text, web_info=None):
             role_label = "Usuário" if msg["role"] == "user" else "Assistente"
             prompt += f"{role_label}: {msg['content'][:500]}\n\n"
     
-    prompt += f"Pergunta atual do usuário: {user_text}"
+    # Adiciona a pergunta com dados de busca
+    if web_info:
+        prompt += (
+            f"\nPergunta do usuário: {user_text}\n\n"
+            f"[INFORMAÇÕES TÉCNICAS ENCONTRADAS - USE ESTES DADOS NA SUA RESPOSTA]:\n"
+            f"{web_info[:4000]}"
+        )
+    else:
+        prompt += f"\nPergunta do usuário: {user_text}"
     return prompt
 
 # --- Handlers ---
@@ -1016,13 +1080,21 @@ def handle_text(chat_id, text):
     logger.info(f"Texto de {chat_id}: {text[:80]}")
     send_typing(chat_id)
     
-    # Busca web técnica se detectar equipamento/marca/termo técnico
+    # Busca web técnica - SEMPRE tenta buscar para perguntas técnicas
     web_info = None
     if detect_equipment_query(text):
         logger.info(f"Busca técnica ativada para: {text[:50]}")
         web_info = search_technical_info(text)
         if web_info:
             logger.info(f"Busca retornou {len(web_info)} chars")
+        else:
+            logger.warning(f"Busca não retornou resultados para: {text[:50]}")
+    else:
+        # Mesmo sem marca/termo específico, tenta buscar se parece pergunta técnica
+        if len(text) > 15 and "?" in text:
+            web_info = search_technical_info(text)
+            if web_info:
+                logger.info(f"Busca geral retornou {len(web_info)} chars")
     
     # Construir mensagens com histórico + info da web
     messages = build_messages_with_history(chat_id, text, web_info)
