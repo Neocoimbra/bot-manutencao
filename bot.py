@@ -44,7 +44,8 @@ DEEPSEEK_MODEL = "deepseek-chat"
 DEEPSEEK_BASE_URL = "https://api.deepseek.com/v1"
 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
-GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "compound-beta")  # compound-beta tem busca web integrada
+GROQ_MODEL_FALLBACK = "llama-3.3-70b-versatile"  # fallback sem busca web
 GROQ_BASE_URL = "https://api.groq.com/openai/v1"
 
 KNOWLEDGE_DIR = Path("/tmp/knowledge_base")
@@ -587,14 +588,22 @@ def call_claude(prompt):
 
 def call_ai_with_fallback(messages_list, gemini_prompt):
     """Tenta APIs em cascata. messages_list para APIs OpenAI-compat, gemini_prompt para Gemini."""
-    # 1. Groq (gratuito e rápido)
+    # 1. Groq compound-beta (com busca web integrada - melhor para perguntas técnicas)
     if GROQ_API_KEY and is_api_available("groq"):
-        logger.info("Tentando Groq...")
+        logger.info(f"Tentando Groq {GROQ_MODEL}...")
         res = call_openai_compatible(messages_list, GROQ_API_KEY, GROQ_BASE_URL, GROQ_MODEL, "Groq")
         if res:
-            logger.info(f"Groq respondeu ({len(res)} chars)")
+            logger.info(f"Groq {GROQ_MODEL} respondeu ({len(res)} chars)")
             track_api_call("Groq", True)
             return res
+        # Se compound-beta falhar, tentar fallback llama
+        if GROQ_MODEL != GROQ_MODEL_FALLBACK:
+            logger.info(f"Tentando Groq fallback {GROQ_MODEL_FALLBACK}...")
+            res = call_openai_compatible(messages_list, GROQ_API_KEY, GROQ_BASE_URL, GROQ_MODEL_FALLBACK, "Groq-Fallback")
+            if res:
+                logger.info(f"Groq fallback respondeu ({len(res)} chars)")
+                track_api_call("Groq-Fallback", True)
+                return res
         track_api_call("Groq", False)
         mark_api_failed("groq")
 
@@ -1080,23 +1089,15 @@ def handle_text(chat_id, text):
     logger.info(f"Texto de {chat_id}: {text[:80]}")
     send_typing(chat_id)
     
-    # Busca web técnica - SEMPRE tenta buscar para perguntas técnicas
+    # Busca web técnica via scraping (fallback caso compound-beta não esteja disponível)
     web_info = None
     if detect_equipment_query(text):
         logger.info(f"Busca técnica ativada para: {text[:50]}")
         web_info = search_technical_info(text)
         if web_info:
             logger.info(f"Busca retornou {len(web_info)} chars")
-        else:
-            logger.warning(f"Busca não retornou resultados para: {text[:50]}")
-    else:
-        # Mesmo sem marca/termo específico, tenta buscar se parece pergunta técnica
-        if len(text) > 15 and "?" in text:
-            web_info = search_technical_info(text)
-            if web_info:
-                logger.info(f"Busca geral retornou {len(web_info)} chars")
     
-    # Construir mensagens com histórico + info da web
+    # Construir mensagens com histórico + info da web (se houver)
     messages = build_messages_with_history(chat_id, text, web_info)
     gemini_prompt = build_gemini_prompt_with_history(chat_id, text, web_info)
     
