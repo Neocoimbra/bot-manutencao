@@ -59,7 +59,7 @@ FALLBACK_MESSAGE = "Dificuldade em processar todas as solicitações, procure o 
 
 # Histórico de conversas por chat_id (memória)
 _chat_history = {}  # {chat_id: [{"role": "user", "content": "..."}, {"role": "assistant", "content": "..."}]}
-MAX_HISTORY = 10  # Máximo de pares de mensagens por chat (20 mensagens total)
+MAX_HISTORY = 5  # Máximo de pares de mensagens por chat (10 mensagens total)
 HISTORY_TTL = 7200  # 2 horas sem atividade limpa o histórico
 _chat_last_active = {}  # {chat_id: timestamp}
 
@@ -819,8 +819,8 @@ def build_system_prompt():
     prompt = SYSTEM_PROMPT_BASE
     if knowledge:
         prompt += (
-            "\n\n=== INFORMAÇÕES DOS MANUAIS CARREGADOS (PRIORIDADE MÁXIMA) ===\n"
-            + knowledge[:4000]
+            "\n\n=== MANUAIS ===\n"
+            + knowledge[:2000]
         )
     return prompt
 
@@ -829,17 +829,17 @@ def build_messages_with_history(chat_id, user_text, web_info=None):
     system_prompt = build_system_prompt()
     messages = [{"role": "system", "content": system_prompt}]
     
-    # Adiciona histórico anterior
+    # Adiciona histórico anterior (limitado para não estourar token limit)
     history = get_history(chat_id)
-    for msg in history:
-        messages.append(msg)
+    for msg in history[-6:]:  # Máximo 6 mensagens de histórico (3 pares)
+        messages.append({"role": msg["role"], "content": msg["content"][:300]})
     
     # Adiciona mensagem atual COM as informações de busca embutidas
     if web_info:
         enriched_text = (
             f"{user_text}\n\n"
-            f"[INFORMAÇÕES TÉCNICAS ENCONTRADAS - USE ESTES DADOS NA SUA RESPOSTA]:\n"
-            f"{web_info[:4000]}"
+            f"[DADOS TÉCNICOS ENCONTRADOS - USE NA RESPOSTA]:\n"
+            f"{web_info[:2000]}"
         )
         messages.append({"role": "user", "content": enriched_text})
     else:
@@ -851,20 +851,20 @@ def build_gemini_prompt_with_history(chat_id, user_text, web_info=None):
     system_prompt = build_system_prompt()
     prompt = system_prompt
     
-    # Adiciona histórico como contexto
+    # Adiciona histórico como contexto (limitado)
     history = get_history(chat_id)
     if history:
-        prompt += "\n\n=== HISTÓRICO DA CONVERSA ===\n"
-        for msg in history:
-            role_label = "Usuário" if msg["role"] == "user" else "Assistente"
-            prompt += f"{role_label}: {msg['content'][:500]}\n\n"
+        prompt += "\n\n=== HISTÓRICO ===\n"
+        for msg in history[-6:]:
+            role_label = "U" if msg["role"] == "user" else "A"
+            prompt += f"{role_label}: {msg['content'][:200]}\n"
     
     # Adiciona a pergunta com dados de busca
     if web_info:
         prompt += (
             f"\nPergunta do usuário: {user_text}\n\n"
-            f"[INFORMAÇÕES TÉCNICAS ENCONTRADAS - USE ESTES DADOS NA SUA RESPOSTA]:\n"
-            f"{web_info[:4000]}"
+            f"[DADOS TÉCNICOS - USE NA RESPOSTA]:\n"
+            f"{web_info[:2000]}"
         )
     else:
         prompt += f"\nPergunta do usuário: {user_text}"
