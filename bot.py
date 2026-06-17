@@ -44,8 +44,8 @@ DEEPSEEK_MODEL = "deepseek-chat"
 DEEPSEEK_BASE_URL = "https://api.deepseek.com/v1"
 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
-GROQ_MODEL = os.environ.get("GROQ_MODEL", "compound-beta")  # compound-beta tem busca web integrada
-GROQ_MODEL_FALLBACK = "llama-3.3-70b-versatile"  # fallback sem busca web
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")  # modelo principal - aceita payloads grandes
+GROQ_MODEL_FALLBACK = "llama-3.1-8b-instant"  # fallback rapido
 GROQ_BASE_URL = "https://api.groq.com/openai/v1"
 
 KNOWLEDGE_DIR = Path("/tmp/knowledge_base")
@@ -168,25 +168,16 @@ logger = logging.getLogger(__name__)
 
 # --- System Prompt ---
 SYSTEM_PROMPT_BASE = (
-    "Você é um técnico de manutenção especialista em equipamentos automotivos "
-    "e agrícolas com acesso a busca na internet. Responda em português brasileiro.\n\n"
-    "VOCÊ TEM ACESSO A INFORMAÇÕES DA INTERNET. Quando receber dados de busca técnica, "
-    "USE-OS na resposta. NUNCA diga que 'não tem acesso' a informações.\n\n"
-    "REGRAS OBRIGATÓRIAS:\n"
-    "1. OBJETIVO e DIRETO. Sem introduções, saudações ou enrolação.\n"
-    "2. Se receber INFORMAÇÕES DE BUSCA TÉCNICA abaixo, USE-AS como base da resposta. "
-    "Extraia os dados relevantes e apresente de forma clara.\n"
-    "3. NUNCA INVENTE números específicos (horas, torques, pressões, medidas). "
-    "Só cite valores que estão EXPLICITAMENTE nas informações fornecidas.\n"
-    "4. Se o dado específico NÃO está nas informações fornecidas, diga: "
-    "'Não localizei este dado específico nas fontes disponíveis. "
-    "Recomendo consultar o Manual de Reparação/Operador do [modelo], seção [sugestão].'\n"
-    "5. NUNCA diga 'não tenho acesso' ou 'não posso acessar sites'. "
-    "Você TEM acesso via busca automática.\n"
-    "6. Formato: dado técnico direto → fonte → observação se necessário.\n"
-    "7. Quando o usuário corrigir algo, agradeça e registre.\n"
-    "8. Máximo 3-4 parágrafos.\n"
-    "9. Use seu conhecimento técnico geral para contextualizar, mas não invente valores."
+    "Você é um técnico especialista em manutenção de equipamentos agrícolas e automotivos. "
+    "Responda em português brasileiro.\n\n"
+    "REGRAS:\n"
+    "1. OBJETIVO e DIRETO - sem enrolação.\n"
+    "2. Use seu conhecimento técnico para responder com precisão.\n"
+    "3. Formato preferido: CAUSA → VERIFICAÇÃO → SOLUÇÃO.\n"
+    "4. Cite valores técnicos (torques, pressões, intervalos) quando souber.\n"
+    "5. Se NÃO souber um dado específico, diga claramente e indique a seção do manual.\n"
+    "6. Máximo 3 parágrafos.\n"
+    "7. Quando o usuário corrigir, agradeça brevemente."
 )
 
 # --- Busca Web Técnica Avançada ---
@@ -1079,6 +1070,46 @@ def handle_diag(chat_id):
     report += "\n\n🔄 Cache de falhas limpo."
     send_message(chat_id, report)
 
+def call_compound_beta(user_text):
+    """Chama compound-beta com payload MINIMO (sem histórico) para busca web integrada"""
+    if not GROQ_API_KEY:
+        return None
+    url = f"{GROQ_BASE_URL}/chat/completions"
+    # Payload mínimo - só system prompt curto + pergunta
+    messages = [
+        {"role": "system", "content": "Você é um técnico especialista em manutenção de equipamentos agrícolas e automotivos. Responda em português brasileiro, de forma OBJETIVA e DIRETA. Use formato: CAUSA → VERIFICAÇÃO → SOLUÇÃO quando aplicável. Cite dados técnicos específicos (torques, pressões, intervalos) quando disponíveis. Máximo 3 parágrafos."},
+        {"role": "user", "content": user_text}
+    ]
+    payload = json.dumps({
+        "model": "compound-beta",
+        "messages": messages,
+        "max_tokens": 1200,
+    }).encode("utf-8")
+    req = urllib.request.Request(url, data=payload, headers={
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "User-Agent": USER_AGENT,
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            choices = data.get('choices', [])
+            if choices:
+                content = choices[0].get('message', {}).get('content', '')
+                if content and len(content) > 20:
+                    logger.info(f"compound-beta respondeu ({len(content)} chars)")
+                    track_api_call("Groq-compound", True)
+                    return content
+            return None
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="ignore")
+        logger.warning(f"compound-beta falhou: HTTP {e.code}: {body[:100]}")
+        track_api_call("Groq-compound", False)
+        return None
+    except Exception as e:
+        logger.warning(f"compound-beta erro: {e}")
+        return None
+
 def handle_text(chat_id, text):
     # Comando para limpar histórico
     if text.strip().lower() in ["/limpar", "/novo", "/reset"]:
@@ -1089,19 +1120,21 @@ def handle_text(chat_id, text):
     logger.info(f"Texto de {chat_id}: {text[:80]}")
     send_typing(chat_id)
     
-    # Busca web técnica via scraping (fallback caso compound-beta não esteja disponível)
-    web_info = None
+    reply = None
+    
+    # FLUXO 1: Pergunta técnica sobre equipamento -> compound-beta (busca web integrada)
     if detect_equipment_query(text):
-        logger.info(f"Busca técnica ativada para: {text[:50]}")
-        web_info = search_technical_info(text)
-        if web_info:
-            logger.info(f"Busca retornou {len(web_info)} chars")
+        logger.info(f"Pergunta técnica detectada - usando compound-beta")
+        reply = call_compound_beta(text)
+        if reply:
+            logger.info(f"compound-beta respondeu com sucesso")
     
-    # Construir mensagens com histórico + info da web (se houver)
-    messages = build_messages_with_history(chat_id, text, web_info)
-    gemini_prompt = build_gemini_prompt_with_history(chat_id, text, web_info)
-    
-    reply = call_ai_with_fallback(messages, gemini_prompt)
+    # FLUXO 2: Se compound-beta não respondeu ou não é pergunta técnica -> llama com histórico
+    if not reply:
+        logger.info(f"Usando llama com histórico")
+        messages = build_messages_with_history(chat_id, text, None)
+        gemini_prompt = build_gemini_prompt_with_history(chat_id, text, None)
+        reply = call_ai_with_fallback(messages, gemini_prompt)
     
     if reply:
         # Salvar no histórico
