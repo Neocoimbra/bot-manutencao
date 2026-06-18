@@ -1075,9 +1075,20 @@ def call_compound_beta(user_text):
     if not GROQ_API_KEY:
         return None
     url = f"{GROQ_BASE_URL}/chat/completions"
-    # Payload mínimo - só system prompt curto + pergunta
+    # Payload mínimo - system prompt curto + pergunta enriquecida
+    system = (
+        "Você é um técnico especialista em equipamentos agrícolas e automotivos. "
+        "Responda em português brasileiro. REGRAS IMPORTANTES:\n"
+        "1. Seja OBJETIVO (formato CAUSA → VERIFICAÇÃO → SOLUÇÃO).\n"
+        "2. CUIDADO para não confundir modelos similares. Ex: JD 950 (trator antigo) ≠ JD CH 950 (colhedora). "
+        "Confirme que os dados são do modelo EXATO perguntado.\n"
+        "3. Se não encontrar dados CONFIRMADOS do modelo específico, diga: "
+        "'Não encontrei dados confirmados para [modelo exato]. Consulte o manual do fabricante.'\n"
+        "4. NUNCA invente valores. Só cite dados que você encontrou em fontes confiáveis.\n"
+        "5. Máximo 3 parágrafos."
+    )
     messages = [
-        {"role": "system", "content": "Você é um técnico especialista em manutenção de equipamentos agrícolas e automotivos. Responda em português brasileiro, de forma OBJETIVA e DIRETA. Use formato: CAUSA → VERIFICAÇÃO → SOLUÇÃO quando aplicável. Cite dados técnicos específicos (torques, pressões, intervalos) quando disponíveis. Máximo 3 parágrafos."},
+        {"role": "system", "content": system},
         {"role": "user", "content": user_text}
     ]
     payload = json.dumps({
