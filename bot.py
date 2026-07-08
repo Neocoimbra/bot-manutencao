@@ -48,6 +48,9 @@ GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")  # modelo p
 GROQ_MODEL_FALLBACK = "llama-3.1-8b-instant"  # fallback rapido
 GROQ_BASE_URL = "https://api.groq.com/openai/v1"
 
+# API de busca web (Serper.dev - 2500 buscas grátis no cadastro)
+SERPER_API_KEY = os.environ.get("SERPER_API_KEY", "")
+
 KNOWLEDGE_DIR = Path("/tmp/knowledge_base")
 KNOWLEDGE_DIR.mkdir(exist_ok=True)
 
@@ -275,20 +278,88 @@ def extract_brand_model(text):
     
     return found_brand, found_model
 
-def do_web_search(search_terms, timeout=8):
-    """Executa busca web - tenta DuckDuckGo e Google como fallback"""
-    results = _search_duckduckgo(search_terms, timeout)
-    if not results:
-        results = _search_google(search_terms, timeout)
+def do_web_search(search_terms, timeout=10):
+    """Executa busca web via Serper.dev API (Google Search API)"""
+    if SERPER_API_KEY:
+        results = _search_serper(search_terms, timeout)
+        if results:
+            return results
+    # Fallback: DuckDuckGo HTML (pode não funcionar no Render)
+    return _search_duckduckgo_fallback(search_terms, timeout)
+
+def _search_serper(search_terms, timeout=10):
+    """Busca via Serper.dev - Google Search API confiável"""
+    results = []
+    try:
+        url = "https://google.serper.dev/search"
+        payload = json.dumps({
+            "q": search_terms,
+            "gl": "br",
+            "hl": "pt-br",
+            "num": 8
+        }).encode("utf-8")
+        req = urllib.request.Request(url, data=payload, headers={
+            "X-API-KEY": SERPER_API_KEY,
+            "Content-Type": "application/json",
+            "User-Agent": USER_AGENT,
+        })
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        
+        # Extrair resultados orgânicos
+        organic = data.get("organic", [])
+        for item in organic[:8]:
+            title = item.get("title", "")
+            snippet = item.get("snippet", "")
+            link = item.get("link", "")
+            if title and snippet:
+                results.append({
+                    "title": title,
+                    "snippet": snippet,
+                    "url": link,
+                })
+        
+        # Extrair knowledge graph se disponível
+        kg = data.get("knowledgeGraph", {})
+        if kg:
+            kg_desc = kg.get("description", "")
+            kg_title = kg.get("title", "")
+            attrs = kg.get("attributes", {})
+            if kg_desc or attrs:
+                kg_text = kg_desc
+                for k, v in attrs.items():
+                    kg_text += f" | {k}: {v}"
+                results.insert(0, {
+                    "title": f"Google Knowledge: {kg_title}",
+                    "snippet": kg_text.strip(),
+                    "url": "",
+                })
+        
+        # Extrair answer box se disponível
+        answer = data.get("answerBox", {})
+        if answer:
+            ans_text = answer.get("answer", "") or answer.get("snippet", "")
+            if ans_text:
+                results.insert(0, {
+                    "title": "Resposta direta Google",
+                    "snippet": ans_text,
+                    "url": "",
+                })
+        
+        logger.info(f"Serper retornou {len(results)} resultados para: {search_terms[:50]}")
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="ignore")
+        logger.warning(f"Serper falhou: HTTP {e.code}: {body[:100]}")
+    except Exception as e:
+        logger.warning(f"Serper falhou: {e}")
     return results
 
-def _search_duckduckgo(search_terms, timeout=8):
-    """Busca via DuckDuckGo HTML"""
+def _search_duckduckgo_fallback(search_terms, timeout=8):
+    """Busca via DuckDuckGo HTML como fallback"""
     results = []
     try:
         encoded = urllib.parse.quote(search_terms)
         url = f"https://html.duckduckgo.com/html/?q={encoded}"
-        
         req = urllib.request.Request(url, headers={
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             "Accept": "text/html,application/xhtml+xml",
@@ -296,59 +367,15 @@ def _search_duckduckgo(search_terms, timeout=8):
         })
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             html = resp.read().decode("utf-8", errors="ignore")
-        
         snippets = re.findall(r'<a class="result__snippet"[^>]*>(.*?)</a>', html, re.DOTALL)
         titles = re.findall(r'<a class="result__a"[^>]*>(.*?)</a>', html, re.DOTALL)
-        urls = re.findall(r'<a class="result__url"[^>]*href="([^"]+)"', html)
-        
         for i, (title, snippet) in enumerate(zip(titles[:5], snippets[:5])):
             clean_title = re.sub(r'<[^>]+>', '', title).strip()
             clean_snippet = re.sub(r'<[^>]+>', '', snippet).strip()
             if clean_title and clean_snippet and len(clean_snippet) > 20:
-                source = urls[i] if i < len(urls) else ""
-                results.append({
-                    "title": clean_title,
-                    "snippet": clean_snippet,
-                    "url": source,
-                })
+                results.append({"title": clean_title, "snippet": clean_snippet, "url": ""})
     except Exception as e:
-        logger.warning(f"DuckDuckGo falhou: {e}")
-    return results
-
-def _search_google(search_terms, timeout=8):
-    """Busca via Google (scraping básico como fallback)"""
-    results = []
-    try:
-        encoded = urllib.parse.quote(search_terms)
-        url = f"https://www.google.com/search?q={encoded}&hl=pt-BR&num=5"
-        
-        req = urllib.request.Request(url, headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml",
-            "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
-        })
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            html = resp.read().decode("utf-8", errors="ignore")
-        
-        # Extrair blocos de resultado do Google
-        blocks = re.findall(r'<div class="[^"]*"[^>]*>.*?</div>', html[:50000], re.DOTALL)
-        
-        # Tentar extrair texto útil
-        text_content = re.sub(r'<[^>]+>', ' ', html[:30000])
-        text_content = re.sub(r'\s+', ' ', text_content)
-        
-        # Extrair frases que parecem resultados (entre pontos, com mais de 50 chars)
-        sentences = re.findall(r'([A-ZÀ-Ü][^.!?]{50,200}[.!?])', text_content)
-        for s in sentences[:5]:
-            s = s.strip()
-            if len(s) > 50 and not any(x in s.lower() for x in ['google', 'cookie', 'privacy', 'javascript']):
-                results.append({
-                    "title": "Google",
-                    "snippet": s,
-                    "url": "",
-                })
-    except Exception as e:
-        logger.warning(f"Google falhou: {e}")
+        logger.warning(f"DuckDuckGo fallback falhou: {e}")
     return results
 
 def fetch_page_content(url, max_chars=3000):
@@ -905,19 +932,21 @@ def handle_start(chat_id):
     send_message(chat_id,
         "🔧 Especialista em Manutenção Online!\n\n"
         "Sou um assistente de IA especializado em manutenção e reparação de "
-        "equipamentos automotivos e de agricultura.\n\n"
+        "equipamentos automotivos e agrícolas.\n\n"
         "📋 O que posso fazer:\n"
-        "• Responder dúvidas sobre manutenção preventiva e corretiva\n"
-        "• Ajudar a diagnosticar problemas em equipamentos\n"
-        "• Orientar sobre procedimentos de reparo\n"
-        "• Lembrar do contexto da conversa (memória)\n\n"
-        "📄 Aceito documentos (PDF, Word, TXT) com manuais técnicos\n"
-        "🎤 Aceito mensagens de voz e áudio!\n\n"
+        "• Diagnosticar problemas em equipamentos\n"
+        "• Buscar informações técnicas dos fabricantes\n"
+        "• Analisar FOTOS de peças, painéis e componentes\n"
+        "• Orientar sobre manutenção preventiva e corretiva\n"
+        "• Lembrar do contexto da conversa\n\n"
+        "📷 Envie FOTOS de peças/painéis para diagnóstico visual\n"
+        "🎤 Aceito mensagens de voz\n"
+        "📄 Aceito manuais (PDF, Word, TXT)\n\n"
         "📌 Comandos:\n"
-        "/limpar - Limpar histórico e começar novo assunto\n"
-        "/status - Ver status das APIs (admin)\n"
+        "/limpar - Limpar histórico\n"
+        "/status - Status das APIs (admin)\n"
         "/diag - Diagnosticar APIs (admin)\n\n"
-        "Como posso ajudar no diagnóstico hoje?"
+        "Informe o equipamento (marca, modelo, ano) e o problema."
     )
 
 def handle_status(chat_id):
@@ -946,9 +975,11 @@ def handle_status(chat_id):
         f"🔹 OPENAI_API_KEY: {mask_key(OPENAI_API_KEY)}\n"
         f"   Modelo: {OPENAI_MODEL}\n"
         f"   URL: {OPENAI_BASE_URL}\n\n"
+        f"🔹 SERPER_API_KEY (busca web): {mask_key(SERPER_API_KEY)}\n\n"
         f"🔹 TELEGRAM_TOKEN: {mask_key(TELEGRAM_TOKEN)}\n"
         f"🔹 RENDER_URL: {RENDER_URL or '❌ NÃO CONFIGURADA'}\n"
         f"🔹 ADMIN_ID: {ADMIN_ID}\n\n"
+        f"📷 Gemini Vision (fotos): {'✅ Ativo' if GEMINI_KEYS else '❌ Sem chave Gemini'}\n"
         f"📁 Manuais no banco: {sum(1 for f in KNOWLEDGE_DIR.iterdir() if f.suffix == '.txt')}\n"
         f"🚫 APIs em cache de falha: {list(_api_fail_cache.keys()) if _api_fail_cache else 'nenhuma'}"
     )
@@ -1227,6 +1258,125 @@ def handle_voice(chat_id, voice_or_audio):
         logger.error(f"Erro áudio: {e}", exc_info=True)
         send_message(chat_id, "Desculpe, erro ao processar o áudio.")
 
+def handle_photo(chat_id, photo_list, caption=""):
+    """Analisa foto enviada pelo usuário usando Gemini Vision para diagnóstico"""
+    logger.info(f"Foto de {chat_id}")
+    send_typing(chat_id)
+    send_message(chat_id, "📷 Analisando a imagem...")
+    
+    try:
+        # Pegar a maior resolução disponível
+        best_photo = photo_list[-1]  # Última é a maior
+        file_id = best_photo.get("file_id")
+        
+        # Baixar a foto
+        local_path = download_file(file_id)
+        if not local_path:
+            send_message(chat_id, "⚠️ Não consegui baixar a imagem.")
+            return
+        
+        # Ler e converter para base64
+        with open(local_path, "rb") as f:
+            image_data = base64.b64encode(f.read()).decode("utf-8")
+        
+        # Determinar mime type
+        if local_path.lower().endswith(".png"):
+            mime_type = "image/png"
+        else:
+            mime_type = "image/jpeg"
+        
+        # Montar prompt de análise
+        analysis_prompt = (
+            "Você é um técnico sênior de manutenção com 20+ anos de experiência. "
+            "Analise esta imagem de um equipamento/peça/componente e forneça:\n"
+            "1. IDENTIFICAÇÃO: O que é mostrado na imagem (peça, componente, painel, etc.)\n"
+            "2. DIAGNÓSTICO: Se houver problema visível, descreva (desgaste, vazamento, quebra, código de erro, etc.)\n"
+            "3. RECOMENDAÇÃO: Ação recomendada (reparo, substituição, ajuste, etc.)\n\n"
+            "Seja OBJETIVO e DIRETO. Tom formal e prático. Português brasileiro.\n"
+            "Se não conseguir identificar com certeza, diga claramente."
+        )
+        if caption:
+            analysis_prompt += f"\n\nO usuário informou: {caption}"
+        
+        # Verificar histórico para contexto
+        history = get_history(chat_id)
+        if history:
+            last_msgs = history[-4:]  # Últimas 2 trocas
+            context = "\n".join([f"{'Usuário' if m['role']=='user' else 'Bot'}: {m['content'][:150]}" for m in last_msgs])
+            analysis_prompt += f"\n\nContexto da conversa anterior:\n{context}"
+        
+        # Tentar Gemini Vision (suporta imagens nativamente)
+        reply = None
+        for key in GEMINI_KEYS:
+            reply = _call_gemini_vision(image_data, mime_type, analysis_prompt, key)
+            if reply:
+                break
+        
+        # Fallback: descrever que não tem visão disponível
+        if not reply:
+            reply = (
+                "⚠️ Não consegui analisar a imagem (APIs de visão indisponíveis).\n\n"
+                "Por favor, descreva o que você vê na imagem:\n"
+                "• Qual equipamento/peça?\n"
+                "• Qual o problema visível?\n"
+                "• Algum código de erro no painel?\n\n"
+                "Assim posso ajudar no diagnóstico."
+            )
+        
+        # Salvar no histórico
+        user_msg = caption if caption else "[Enviou uma foto para análise]"
+        add_to_history(chat_id, "user", user_msg)
+        add_to_history(chat_id, "assistant", reply)
+        send_message(chat_id, reply)
+        
+        # Limpar arquivo temporário
+        try:
+            os.remove(local_path)
+        except:
+            pass
+            
+    except Exception as e:
+        logger.error(f"Erro foto: {e}", exc_info=True)
+        send_message(chat_id, "❌ Erro ao processar a imagem. Tente descrever o problema por texto.")
+
+def _call_gemini_vision(image_data, mime_type, prompt, api_key):
+    """Chama Gemini com imagem para análise visual"""
+    try:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={api_key}"
+        payload = json.dumps({
+            "contents": [{
+                "parts": [
+                    {"inline_data": {"mime_type": mime_type, "data": image_data}},
+                    {"text": prompt}
+                ]
+            }],
+            "generationConfig": {"maxOutputTokens": 1500, "temperature": 0.5},
+        }).encode("utf-8")
+        req = urllib.request.Request(url, data=payload, headers={
+            "Content-Type": "application/json",
+            "User-Agent": USER_AGENT,
+        })
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            result = json.loads(resp.read().decode("utf-8"))
+            candidates = result.get("candidates", [])
+            if candidates:
+                parts = candidates[0].get("content", {}).get("parts", [])
+                if parts:
+                    text = parts[0].get("text", "")
+                    if text:
+                        logger.info(f"Gemini Vision respondeu ({len(text)} chars)")
+                        track_api_call("Gemini-Vision", True)
+                        return text
+        return None
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="ignore")
+        logger.warning(f"Gemini Vision falhou: HTTP {e.code}: {body[:100]}")
+        track_api_call("Gemini-Vision", False)
+        return None
+    except Exception as e:
+        logger.warning(f"Gemini Vision erro: {e}")
+        return None
+
 def handle_document(chat_id, document):
     if chat_id != ADMIN_ID:
         send_message(chat_id, "⚠️ Apenas o administrador pode enviar documentos para o banco de conhecimento.")
@@ -1291,6 +1441,10 @@ def process_update(update):
         elif msg.get("audio"):
             _stats["total_audio"] += 1
             handle_voice(chat_id, msg["audio"])
+        elif msg.get("photo"):
+            _stats["total_messages"] += 1
+            caption = msg.get("caption", "")
+            handle_photo(chat_id, msg["photo"], caption)
         elif msg.get("document"):
             _stats["total_documents"] += 1
             handle_document(chat_id, msg["document"])
@@ -1677,7 +1831,7 @@ def main():
     load_stats()
     
     logger.info("=" * 50)
-    logger.info("BOT MANUTENÇÃO - WEBHOOK MODE v2.3")
+    logger.info("BOT MANUTENÇÃO - WEBHOOK MODE v3.3")
     logger.info(f"Render URL: {RENDER_URL}")
     logger.info(f"Admin ID: {ADMIN_ID}")
     logger.info(f"Groq: {'sim' if GROQ_API_KEY else 'não'}")
@@ -1685,6 +1839,8 @@ def main():
     logger.info(f"DeepSeek: {'sim' if DEEPSEEK_API_KEY else 'não'}")
     logger.info(f"Claude: {'sim' if CLAUDE_API_KEY else 'não'}")
     logger.info(f"OpenAI: {'sim' if OPENAI_API_KEY else 'não'}")
+    logger.info(f"Serper (busca web): {'sim' if SERPER_API_KEY else 'não'}")
+    logger.info(f"Gemini Vision (fotos): {'sim' if GEMINI_KEYS else 'não'}")
     logger.info(f"Admin Panel: {RENDER_URL}/admin (user: admin)")
     logger.info("=" * 50)
 
