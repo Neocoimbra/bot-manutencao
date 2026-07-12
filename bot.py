@@ -1305,14 +1305,19 @@ def handle_photo(chat_id, photo_list, caption=""):
             context = "\n".join([f"{'Usuário' if m['role']=='user' else 'Bot'}: {m['content'][:150]}" for m in last_msgs])
             analysis_prompt += f"\n\nContexto da conversa anterior:\n{context}"
         
-        # Tentar Gemini Vision (suporta imagens nativamente)
+        # Tentar Groq Vision primeiro (gratuito e rápido)
         reply = None
-        for key in GEMINI_KEYS:
-            reply = _call_gemini_vision(image_data, mime_type, analysis_prompt, key)
-            if reply:
-                break
+        if GROQ_API_KEY:
+            reply = _call_groq_vision(image_data, mime_type, analysis_prompt)
         
-        # Fallback: descrever que não tem visão disponível
+        # Fallback: Gemini Vision
+        if not reply:
+            for key in GEMINI_KEYS:
+                reply = _call_gemini_vision(image_data, mime_type, analysis_prompt, key)
+                if reply:
+                    break
+        
+        # Fallback final: pedir descrição por texto
         if not reply:
             reply = (
                 "⚠️ Não consegui analisar a imagem (APIs de visão indisponíveis).\n\n"
@@ -1338,6 +1343,108 @@ def handle_photo(chat_id, photo_list, caption=""):
     except Exception as e:
         logger.error(f"Erro foto: {e}", exc_info=True)
         send_message(chat_id, "❌ Erro ao processar a imagem. Tente descrever o problema por texto.")
+
+def _call_groq_vision(image_data, mime_type, prompt):
+    """Chama Groq com modelo de visão (Llama 3.2 Vision) para análise de imagem"""
+    try:
+        # Modelo de visão do Groq
+        vision_model = "meta-llama/llama-4-scout-17b-16e-instruct"
+        
+        url = f"{GROQ_BASE_URL}/chat/completions"
+        payload = json.dumps({
+            "model": vision_model,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:{mime_type};base64,{image_data}"
+                            }
+                        },
+                        {
+                            "type": "text",
+                            "text": prompt
+                        }
+                    ]
+                }
+            ],
+            "max_tokens": 1500,
+            "temperature": 0.5,
+        }).encode("utf-8")
+        req = urllib.request.Request(url, data=payload, headers={
+            "Authorization": f"Bearer {GROQ_API_KEY}",
+            "Content-Type": "application/json",
+            "User-Agent": USER_AGENT,
+        })
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            result = json.loads(resp.read().decode("utf-8"))
+            choices = result.get("choices", [])
+            if choices:
+                text = choices[0].get("message", {}).get("content", "")
+                if text:
+                    logger.info(f"Groq Vision respondeu ({len(text)} chars)")
+                    track_api_call("Groq-Vision", True)
+                    return text
+        return None
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="ignore")
+        logger.warning(f"Groq Vision falhou: HTTP {e.code}: {body[:150]}")
+        track_api_call("Groq-Vision", False)
+        # Tentar modelo alternativo
+        if "not found" in body.lower() or "not supported" in body.lower():
+            return _call_groq_vision_fallback(image_data, mime_type, prompt)
+        return None
+    except Exception as e:
+        logger.warning(f"Groq Vision erro: {e}")
+        return None
+
+def _call_groq_vision_fallback(image_data, mime_type, prompt):
+    """Fallback: tenta llama-3.2-11b-vision-preview"""
+    try:
+        vision_model = "llama-3.2-11b-vision-preview"
+        url = f"{GROQ_BASE_URL}/chat/completions"
+        payload = json.dumps({
+            "model": vision_model,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:{mime_type};base64,{image_data}"
+                            }
+                        },
+                        {
+                            "type": "text",
+                            "text": prompt
+                        }
+                    ]
+                }
+            ],
+            "max_tokens": 1500,
+            "temperature": 0.5,
+        }).encode("utf-8")
+        req = urllib.request.Request(url, data=payload, headers={
+            "Authorization": f"Bearer {GROQ_API_KEY}",
+            "Content-Type": "application/json",
+            "User-Agent": USER_AGENT,
+        })
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            result = json.loads(resp.read().decode("utf-8"))
+            choices = result.get("choices", [])
+            if choices:
+                text = choices[0].get("message", {}).get("content", "")
+                if text:
+                    logger.info(f"Groq Vision fallback respondeu ({len(text)} chars)")
+                    track_api_call("Groq-Vision-FB", True)
+                    return text
+        return None
+    except Exception as e:
+        logger.warning(f"Groq Vision fallback erro: {e}")
+        return None
 
 def _call_gemini_vision(image_data, mime_type, prompt, api_key):
     """Chama Gemini com imagem para análise visual"""
