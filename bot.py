@@ -893,9 +893,13 @@ def build_messages_with_history(chat_id, user_text, web_info=None):
     # Adiciona mensagem atual COM as informações de busca embutidas
     if web_info:
         enriched_text = (
-            f"{user_text}\n\n"
-            f"[DADOS TÉCNICOS ENCONTRADOS - USE NA RESPOSTA]:\n"
-            f"{web_info[:2000]}"
+            f"PERGUNTA: {user_text}\n\n"
+            f"===== DADOS REAIS DOS FABRICANTES (OBRIGATÓRIO USAR) =====\n"
+            f"{web_info[:2500]}\n"
+            f"===== FIM DOS DADOS =====\n\n"
+            f"INSTRUÇÃO: Responda a pergunta acima usando EXCLUSIVAMENTE os dados fornecidos. "
+            f"Não invente. Se os dados acima contêm a resposta, use-os diretamente. "
+            f"Se não contêm, diga que não encontrou o dado específico."
         )
         messages.append({"role": "user", "content": enriched_text})
     else:
@@ -918,9 +922,11 @@ def build_gemini_prompt_with_history(chat_id, user_text, web_info=None):
     # Adiciona a pergunta com dados de busca
     if web_info:
         prompt += (
-            f"\nPergunta do usuário: {user_text}\n\n"
-            f"[DADOS TÉCNICOS - USE NA RESPOSTA]:\n"
-            f"{web_info[:2000]}"
+            f"\nPERGUNTA: {user_text}\n\n"
+            f"===== DADOS REAIS DOS FABRICANTES (OBRIGATÓRIO USAR) =====\n"
+            f"{web_info[:2500]}\n"
+            f"===== FIM DOS DADOS =====\n\n"
+            f"INSTRUÇÃO: Responda usando EXCLUSIVAMENTE os dados acima. Não invente."
         )
     else:
         prompt += f"\nPergunta do usuário: {user_text}"
@@ -1197,20 +1203,21 @@ def handle_text(chat_id, text):
     send_typing(chat_id)
     
     reply = None
+    web_info = None
     
-    # FLUXO 1: Pergunta técnica sobre equipamento -> compound-beta (busca web integrada)
+    # SEMPRE buscar na web quando detectar pergunta técnica
     if detect_equipment_query(text):
-        logger.info(f"Pergunta técnica detectada - usando compound-beta")
-        reply = call_compound_beta(text)
-        if reply:
-            logger.info(f"compound-beta respondeu com sucesso")
+        logger.info(f"Pergunta técnica detectada - buscando na web via Serper")
+        web_info = search_technical_info(text)
+        if web_info:
+            logger.info(f"Busca web retornou {len(web_info)} chars de dados")
+        else:
+            logger.info(f"Busca web não retornou dados")
     
-    # FLUXO 2: Se compound-beta não respondeu ou não é pergunta técnica -> llama com histórico
-    if not reply:
-        logger.info(f"Usando llama com histórico")
-        messages = build_messages_with_history(chat_id, text, None)
-        gemini_prompt = build_gemini_prompt_with_history(chat_id, text, None)
-        reply = call_ai_with_fallback(messages, gemini_prompt)
+    # Usar llama com histórico + dados da busca web injetados na mensagem
+    messages = build_messages_with_history(chat_id, text, web_info)
+    gemini_prompt = build_gemini_prompt_with_history(chat_id, text, web_info)
+    reply = call_ai_with_fallback(messages, gemini_prompt)
     
     if reply:
         # Salvar no histórico
