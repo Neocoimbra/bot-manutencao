@@ -30,23 +30,30 @@ gk1 = os.environ.get("GEMINI_KEY_1", "")
 gk2 = os.environ.get("GEMINI_KEY_2", "")
 if gk1: GEMINI_KEYS.append(gk1)
 if gk2: GEMINI_KEYS.append(gk2)
-GEMINI_MODEL = "gemini-2.0-flash"
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash")
 
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1")
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4.1-nano")
 
 CLAUDE_API_KEY = os.environ.get("CLAUDE_API_KEY", "")
-CLAUDE_MODEL = "claude-3-haiku-20240307"
+CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-haiku-4-5")
 
 DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
-DEEPSEEK_MODEL = "deepseek-chat"
-DEEPSEEK_BASE_URL = "https://api.deepseek.com/v1"
+DEEPSEEK_MODEL = os.environ.get("DEEPSEEK_MODEL", "deepseek-flash")
+DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
-GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")  # modelo principal - aceita payloads grandes
-GROQ_MODEL_FALLBACK = "llama-3.1-8b-instant"  # fallback rapido
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-20b")
+GROQ_MODEL_FALLBACK = os.environ.get("GROQ_MODEL_FALLBACK", "openai/gpt-oss-120b")
 GROQ_BASE_URL = "https://api.groq.com/openai/v1"
+GROQ_VISION_MODEL = os.environ.get(
+    "GROQ_VISION_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct"
+)
+GROQ_VISION_MODEL_FALLBACK = os.environ.get("GROQ_VISION_MODEL_FALLBACK", "")
+GROQ_TRANSCRIPTION_MODEL = os.environ.get(
+    "GROQ_TRANSCRIPTION_MODEL", "whisper-large-v3"
+)
 
 # API de busca web (Serper.dev - 2500 buscas grátis no cadastro)
 SERPER_API_KEY = os.environ.get("SERPER_API_KEY", "")
@@ -503,11 +510,10 @@ def telegram_request(method, data=None, timeout=60):
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", errors="ignore")
-        logger.error(f"HTTP Error {e.code} em {method}: {body[:200]}")
+        logger.error("HTTP Error %s em Telegram %s", e.code, method)
         return None
     except Exception as e:
-        logger.error(f"Erro em {method}: {e}")
+        logger.error("Erro em Telegram %s (%s)", method, _safe_exception_summary(e))
         return None
 
 def send_message(chat_id, text):
@@ -534,24 +540,87 @@ def download_file(file_id):
         return local_path
     return None
 
+def _read_http_error_body(error):
+    try:
+        return error.read().decode("utf-8", errors="ignore")
+    except Exception:
+        return ""
+
+def _classify_provider_error(status_code, body=""):
+    """Converte erros de API em mensagens curtas sem expor respostas ou credenciais."""
+    body_lower = (body or "").lower()
+    credit_markers = (
+        "insufficient", "credit", "balance", "quota exceeded", "out of credits",
+        "billing", "payment required", "spend limit", "blocked_api_access",
+        "saldo", "crédito",
+    )
+    if status_code == 401:
+        return "credencial inválida ou não autorizada (HTTP 401)"
+    if status_code == 402 or any(marker in body_lower for marker in credit_markers):
+        return f"saldo/créditos insuficientes ou indisponíveis (HTTP {status_code})"
+    if status_code == 403:
+        return "acesso negado para esta credencial (HTTP 403)"
+    if status_code == 404:
+        return "modelo ou endpoint não encontrado (HTTP 404)"
+    if status_code == 429:
+        return "limite temporário de chamadas atingido (HTTP 429)"
+    if status_code is not None and status_code >= 500:
+        return f"indisponibilidade temporária do provedor (HTTP {status_code})"
+    if status_code == 400:
+        return "requisição/modelo incompatível ou inválido (HTTP 400)"
+    return f"falha HTTP {status_code or 'desconhecida'}"
+
+def _is_model_not_found(status_code, body=""):
+    body_lower = (body or "").lower()
+    model_markers = ("model", "model_id", "model id")
+    missing_markers = (
+        "not found", "not_found", "decommission", "does not exist",
+        "unknown model", "unavailable",
+    )
+    return (
+        status_code == 404
+        and any(marker in body_lower for marker in model_markers)
+        and any(marker in body_lower for marker in missing_markers)
+    )
+
+def _handle_provider_http_error(provider, error):
+    body = _read_http_error_body(error)
+    summary = _classify_provider_error(getattr(error, "code", None), body)
+    logger.warning("%s falhou: %s", provider, summary)
+    notify_admin_error(provider, summary)
+    return body, summary
+
+def _safe_exception_summary(error):
+    """Retorna somente o tipo da exceção, que não inclui URL nem credenciais."""
+    return type(error).__name__
+
 def notify_admin_error(api_name, error_msg):
-    """Notifica o admin sobre erro de API (apenas primeira vez)"""
-    key = f"{api_name}_{error_msg[:50]}"
+    """Notifica uma única vez por provedor e nunca inclui detalhes de resposta."""
+    key = re.sub(r"\s+key\s+\d+$", "", api_name, flags=re.IGNORECASE).lower()
     if key not in _notified_errors:
         _notified_errors.add(key)
+        if not TELEGRAM_TOKEN:
+            return
         try:
-            send_message(ADMIN_ID, f"⚠️ API {api_name} falhou:\n{error_msg[:300]}")
+            send_message(
+                ADMIN_ID,
+                f"⚠️ Provedor {api_name} indisponível: {error_msg[:160]}. O bot seguirá para outro provedor."
+            )
         except:
             pass
 
 # --- APIs de IA ---
 def call_gemini(prompt, api_key):
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={api_key}"
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
     payload = json.dumps({
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {"maxOutputTokens": 2000, "temperature": 0.7},
     }).encode("utf-8")
-    req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json", "User-Agent": USER_AGENT})
+    req = urllib.request.Request(url, data=payload, headers={
+        "Content-Type": "application/json",
+        "x-goog-api-key": api_key,
+        "User-Agent": USER_AGENT,
+    })
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
             result = json.loads(resp.read().decode("utf-8"))
@@ -564,50 +633,67 @@ def call_gemini(prompt, api_key):
                         return text
             return None
     except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", errors="ignore")
-        error_msg = f"HTTP {e.code}: {body[:150]}"
-        logger.warning(f"Gemini ...{api_key[-6:]} falhou: {error_msg}")
-        notify_admin_error(f"Gemini ...{api_key[-6:]}", error_msg)
+        _handle_provider_http_error("Gemini", e)
         return None
     except Exception as e:
-        logger.warning(f"Gemini ...{api_key[-6:]} erro: {e}")
-        notify_admin_error(f"Gemini ...{api_key[-6:]}", str(e))
+        summary = _safe_exception_summary(e)
+        logger.warning("Gemini erro de conexão/processamento (%s)", summary)
+        notify_admin_error("Gemini", summary)
         return None
 
-def call_openai_compatible(messages_list, api_key, base_url, model, name="API"):
-    """Chama API compatível com OpenAI. messages_list é lista de dicts com role/content."""
+def call_openai_compatible(
+    messages_list, api_key, base_url, model, name="API", fallback_model=None,
+    max_tokens_field="max_tokens",
+):
+    """Chama API compatível com OpenAI; só troca o modelo após 404 de modelo inexistente."""
     if not api_key:
         return None
     url = f"{base_url}/chat/completions"
-    payload = json.dumps({
-        "model": model,
-        "messages": messages_list,
-        "max_tokens": 1500,
-        "temperature": 0.7,
-    }).encode("utf-8")
-    req = urllib.request.Request(url, data=payload, headers={
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {api_key}",
-        "User-Agent": USER_AGENT,
-    })
-    try:
-        with urllib.request.urlopen(req, timeout=45) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            choices = data.get('choices', [])
-            if choices:
-                return choices[0].get('message', {}).get('content', '')
+    models = [model]
+    if fallback_model and fallback_model != model:
+        models.append(fallback_model)
+    for index, current_model in enumerate(models):
+        request_payload = {
+            "model": current_model,
+            "messages": messages_list,
+            "temperature": 0.7,
+        }
+        request_payload[max_tokens_field] = 1500
+        payload = json.dumps(request_payload).encode("utf-8")
+        req = urllib.request.Request(url, data=payload, headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+            "User-Agent": USER_AGENT,
+        })
+        try:
+            with urllib.request.urlopen(req, timeout=45) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                choices = data.get('choices', [])
+                if choices:
+                    content = choices[0].get('message', {}).get('content', '')
+                    if content:
+                        logger.info("%s respondeu usando modelo %s", name, current_model)
+                    return content
+                return None
+        except urllib.error.HTTPError as e:
+            body = _read_http_error_body(e)
+            summary = _classify_provider_error(e.code, body)
+            # Uma única repetição só se a resposta indicar que o modelo não existe.
+            if index == 0 and len(models) > 1 and _is_model_not_found(e.code, body):
+                logger.warning(
+                    "%s: modelo primário não encontrado; tentando o modelo alternativo configurado.",
+                    name,
+                )
+                continue
+            logger.warning("%s (%s) falhou: %s", name, current_model, summary)
+            notify_admin_error(name, summary)
             return None
-    except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", errors="ignore")
-        error_msg = f"HTTP {e.code}: {body[:200]}"
-        logger.warning(f"{name} falhou: {error_msg}")
-        notify_admin_error(name, error_msg)
-        return None
-    except Exception as e:
-        error_msg = str(e)
-        logger.warning(f"{name} erro: {error_msg}")
-        notify_admin_error(name, error_msg)
-        return None
+        except Exception as e:
+            summary = _safe_exception_summary(e)
+            logger.warning("%s erro de conexão/processamento (%s)", name, summary)
+            notify_admin_error(name, summary)
+            return None
+    return None
 
 def call_claude(prompt):
     if not CLAUDE_API_KEY:
@@ -620,7 +706,7 @@ def call_claude(prompt):
     }).encode("utf-8")
     req = urllib.request.Request(url, data=payload, headers={
         "Content-Type": "application/json",
-        "x-api-key": CLAUDE_API_KEY,
+        "Authorization": f"Bearer {CLAUDE_API_KEY}",
         "anthropic-version": "2023-06-01",
         "User-Agent": USER_AGENT,
     })
@@ -629,37 +715,35 @@ def call_claude(prompt):
             result = json.loads(resp.read().decode("utf-8"))
             content = result.get("content", [])
             if content:
-                return content[0].get("text", "")
+                text = "".join(
+                    block.get("text", "") for block in content
+                    if block.get("type") == "text"
+                )
+                return text or None
             return None
     except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", errors="ignore")
-        error_msg = f"HTTP {e.code}: {body[:150]}"
-        logger.warning(f"Claude falhou: {error_msg}")
-        notify_admin_error("Claude", error_msg)
+        _handle_provider_http_error("Claude", e)
         return None
     except Exception as e:
-        logger.warning(f"Claude erro: {e}")
-        notify_admin_error("Claude", str(e))
+        summary = _safe_exception_summary(e)
+        logger.warning("Claude erro de conexão/processamento (%s)", summary)
+        notify_admin_error("Claude", summary)
         return None
 
 def call_ai_with_fallback(messages_list, gemini_prompt):
     """Tenta APIs em cascata. messages_list para APIs OpenAI-compat, gemini_prompt para Gemini."""
-    # 1. Groq compound-beta (com busca web integrada - melhor para perguntas técnicas)
+    # 1. Groq; o modelo alternativo só é chamado se o primário retornar 404 de modelo.
     if GROQ_API_KEY and is_api_available("groq"):
         logger.info(f"Tentando Groq {GROQ_MODEL}...")
-        res = call_openai_compatible(messages_list, GROQ_API_KEY, GROQ_BASE_URL, GROQ_MODEL, "Groq")
+        res = call_openai_compatible(
+            messages_list, GROQ_API_KEY, GROQ_BASE_URL, GROQ_MODEL, "Groq",
+            fallback_model=GROQ_MODEL_FALLBACK,
+            max_tokens_field="max_completion_tokens",
+        )
         if res:
-            logger.info(f"Groq {GROQ_MODEL} respondeu ({len(res)} chars)")
+            logger.info(f"Groq respondeu ({len(res)} chars)")
             track_api_call("Groq", True)
             return res
-        # Se compound-beta falhar, tentar fallback llama
-        if GROQ_MODEL != GROQ_MODEL_FALLBACK:
-            logger.info(f"Tentando Groq fallback {GROQ_MODEL_FALLBACK}...")
-            res = call_openai_compatible(messages_list, GROQ_API_KEY, GROQ_BASE_URL, GROQ_MODEL_FALLBACK, "Groq-Fallback")
-            if res:
-                logger.info(f"Groq fallback respondeu ({len(res)} chars)")
-                track_api_call("Groq-Fallback", True)
-                return res
         track_api_call("Groq", False)
         mark_api_failed("groq")
 
@@ -730,10 +814,11 @@ def transcribe_audio(audio_path):
         return None
 
     # Tenta Groq Whisper primeiro (rápido e gratuito)
-    if GROQ_API_KEY:
+    if GROQ_API_KEY and is_api_available("groq_stt"):
         text = transcribe_with_groq_whisper(wav_path)
         if text:
             return text
+        mark_api_failed("groq_stt")
 
     # Tenta Gemini multimodal
     for i, key in enumerate(GEMINI_KEYS):
@@ -770,7 +855,7 @@ def transcribe_with_groq_whisper(wav_path):
         body += b"\r\n"
         body += f"--{boundary}\r\n".encode()
         body += b'Content-Disposition: form-data; name="model"\r\n\r\n'
-        body += b"whisper-large-v3\r\n"
+        body += f"{GROQ_TRANSCRIPTION_MODEL}\r\n".encode("utf-8")
         body += f"--{boundary}\r\n".encode()
         body += b'Content-Disposition: form-data; name="language"\r\n\r\n'
         body += b"pt\r\n"
@@ -781,21 +866,24 @@ def transcribe_with_groq_whisper(wav_path):
             "Content-Type": f"multipart/form-data; boundary={boundary}",
         })
         resp = conn.getresponse()
-        data = json.loads(resp.read().decode("utf-8"))
+        response_body = resp.read().decode("utf-8", errors="ignore")
         conn.close()
         if resp.status == 200:
+            data = json.loads(response_body)
             return data.get("text", "")
-        logger.warning(f"Groq Whisper falhou (HTTP {resp.status}): {json.dumps(data)[:150]}")
+        summary = _classify_provider_error(resp.status, response_body)
+        logger.warning("Groq Whisper falhou: %s", summary)
+        notify_admin_error("Groq", summary)
         return None
     except Exception as e:
-        logger.warning(f"Groq Whisper erro: {e}")
+        logger.warning("Groq Whisper erro de conexão/processamento (%s)", _safe_exception_summary(e))
         return None
 
 def transcribe_with_gemini(wav_path, api_key):
     try:
         with open(wav_path, "rb") as f:
             audio_data = base64.b64encode(f.read()).decode("utf-8")
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={api_key}"
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
         payload = json.dumps({
             "contents": [{"parts": [
                 {"inline_data": {"mime_type": "audio/wav", "data": audio_data}},
@@ -803,7 +891,11 @@ def transcribe_with_gemini(wav_path, api_key):
             ]}],
             "generationConfig": {"maxOutputTokens": 500, "temperature": 0.1},
         }).encode("utf-8")
-        req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json", "User-Agent": USER_AGENT})
+        req = urllib.request.Request(url, data=payload, headers={
+            "Content-Type": "application/json",
+            "x-goog-api-key": api_key,
+            "User-Agent": USER_AGENT,
+        })
         with urllib.request.urlopen(req, timeout=30) as resp:
             result = json.loads(resp.read().decode("utf-8"))
             candidates = result.get("candidates", [])
@@ -812,8 +904,11 @@ def transcribe_with_gemini(wav_path, api_key):
                 if parts:
                     return parts[0].get("text", "").strip()
         return None
+    except urllib.error.HTTPError as e:
+        _handle_provider_http_error("Gemini STT", e)
+        return None
     except Exception as e:
-        logger.warning(f"Gemini STT erro: {e}")
+        logger.warning("Gemini STT erro de conexão/processamento (%s)", _safe_exception_summary(e))
         return None
 
 def transcribe_with_openai_whisper(wav_path, api_key, base_url):
@@ -964,7 +1059,7 @@ def handle_status(chat_id):
     def mask_key(key):
         if not key:
             return "❌ NÃO CONFIGURADA"
-        return f"✅ Configurada ({key[:8]}...{key[-4:]})"
+        return "✅ Configurada (valor oculto)"
     
     status = (
         "📊 STATUS DAS APIs:\n\n"
@@ -1010,7 +1105,7 @@ def handle_diag(chat_id):
             payload = json.dumps({
                 "model": GROQ_MODEL,
                 "messages": [{"role": "user", "content": test_prompt}],
-                "max_tokens": 20,
+                "max_completion_tokens": 20,
             }).encode("utf-8")
             req = urllib.request.Request(url, data=payload, headers={
                 "Content-Type": "application/json",
@@ -1022,22 +1117,25 @@ def handle_diag(chat_id):
                 reply = data.get('choices', [{}])[0].get('message', {}).get('content', '')
                 results.append(f"✅ Groq: OK - \"{reply[:50]}\"")
         except urllib.error.HTTPError as e:
-            body = e.read().decode("utf-8", errors="ignore")
-            results.append(f"❌ Groq: HTTP {e.code} - {body[:100]}")
+            results.append(f"❌ Groq: {_classify_provider_error(e.code, _read_http_error_body(e))}")
         except Exception as e:
-            results.append(f"❌ Groq: {str(e)[:100]}")
+            results.append(f"❌ Groq: erro local ({_safe_exception_summary(e)})")
     else:
         results.append("⚪ Groq: CHAVE NÃO CONFIGURADA")
     
     # Teste Gemini
     for i, key in enumerate(GEMINI_KEYS):
         try:
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={key}"
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
             payload = json.dumps({
                 "contents": [{"parts": [{"text": test_prompt}]}],
                 "generationConfig": {"maxOutputTokens": 20},
             }).encode("utf-8")
-            req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json", "User-Agent": USER_AGENT})
+            req = urllib.request.Request(url, data=payload, headers={
+                "Content-Type": "application/json",
+                "x-goog-api-key": key,
+                "User-Agent": USER_AGENT,
+            })
             with urllib.request.urlopen(req, timeout=15) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
                 candidates = data.get("candidates", [])
@@ -1047,10 +1145,9 @@ def handle_diag(chat_id):
                 else:
                     results.append(f"❌ Gemini key {i+1}: Sem candidates na resposta")
         except urllib.error.HTTPError as e:
-            body = e.read().decode("utf-8", errors="ignore")
-            results.append(f"❌ Gemini key {i+1}: HTTP {e.code} - {body[:100]}")
+            results.append(f"❌ Gemini key {i+1}: {_classify_provider_error(e.code, _read_http_error_body(e))}")
         except Exception as e:
-            results.append(f"❌ Gemini key {i+1}: {str(e)[:100]}")
+            results.append(f"❌ Gemini key {i+1}: erro local ({_safe_exception_summary(e)})")
     if not GEMINI_KEYS:
         results.append("⚪ Gemini: NENHUMA CHAVE CONFIGURADA")
     
@@ -1073,10 +1170,9 @@ def handle_diag(chat_id):
                 reply = data.get('choices', [{}])[0].get('message', {}).get('content', '')
                 results.append(f"✅ DeepSeek: OK - \"{reply[:50]}\"")
         except urllib.error.HTTPError as e:
-            body = e.read().decode("utf-8", errors="ignore")
-            results.append(f"❌ DeepSeek: HTTP {e.code} - {body[:100]}")
+            results.append(f"❌ DeepSeek: {_classify_provider_error(e.code, _read_http_error_body(e))}")
         except Exception as e:
-            results.append(f"❌ DeepSeek: {str(e)[:100]}")
+            results.append(f"❌ DeepSeek: erro local ({_safe_exception_summary(e)})")
     else:
         results.append("⚪ DeepSeek: CHAVE NÃO CONFIGURADA")
     
@@ -1091,22 +1187,25 @@ def handle_diag(chat_id):
             }).encode("utf-8")
             req = urllib.request.Request(url, data=payload, headers={
                 "Content-Type": "application/json",
-                "x-api-key": CLAUDE_API_KEY,
+                "Authorization": f"Bearer {CLAUDE_API_KEY}",
                 "anthropic-version": "2023-06-01",
                 "User-Agent": USER_AGENT,
             })
             with urllib.request.urlopen(req, timeout=15) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
                 content = data.get("content", [])
-                if content:
-                    results.append(f"✅ Claude: OK - \"{content[0].get('text', '')[:50]}\"")
+                text = "".join(
+                    block.get("text", "") for block in content
+                    if block.get("type") == "text"
+                )
+                if text:
+                    results.append(f"✅ Claude: OK - \"{text[:50]}\"")
                 else:
                     results.append(f"❌ Claude: Resposta vazia")
         except urllib.error.HTTPError as e:
-            body = e.read().decode("utf-8", errors="ignore")
-            results.append(f"❌ Claude: HTTP {e.code} - {body[:100]}")
+            results.append(f"❌ Claude: {_classify_provider_error(e.code, _read_http_error_body(e))}")
         except Exception as e:
-            results.append(f"❌ Claude: {str(e)[:100]}")
+            results.append(f"❌ Claude: erro local ({_safe_exception_summary(e)})")
     else:
         results.append("⚪ Claude: CHAVE NÃO CONFIGURADA")
     
@@ -1130,10 +1229,9 @@ def handle_diag(chat_id):
                 results.append(f"✅ OpenAI: OK - \"{reply[:50]}\"")
 
         except urllib.error.HTTPError as e:
-            body = e.read().decode("utf-8", errors="ignore")
-            results.append(f"❌ OpenAI: HTTP {e.code} - {body[:100]}")
+            results.append(f"❌ OpenAI: {_classify_provider_error(e.code, _read_http_error_body(e))}")
         except Exception as e:
-            results.append(f"❌ OpenAI: {str(e)[:100]}")
+            results.append(f"❌ OpenAI: erro local ({_safe_exception_summary(e)})")
     else:
         results.append("⚪ OpenAI: CHAVE NÃO CONFIGURADA")
     
@@ -1146,7 +1244,7 @@ def handle_diag(chat_id):
     send_message(chat_id, report)
 
 def call_compound_beta(user_text):
-    """Chama compound-beta com payload MINIMO (sem histórico) para busca web integrada"""
+    """Compatibilidade legada: usa o modelo Groq configurado com payload mínimo."""
     if not GROQ_API_KEY:
         return None
     url = f"{GROQ_BASE_URL}/chat/completions"
@@ -1163,7 +1261,7 @@ def call_compound_beta(user_text):
         {"role": "user", "content": user_text}
     ]
     payload = json.dumps({
-        "model": "compound-beta",
+        "model": GROQ_MODEL,
         "messages": messages,
         "max_tokens": 1200,
     }).encode("utf-8")
@@ -1179,17 +1277,16 @@ def call_compound_beta(user_text):
             if choices:
                 content = choices[0].get('message', {}).get('content', '')
                 if content and len(content) > 20:
-                    logger.info(f"compound-beta respondeu ({len(content)} chars)")
+                    logger.info(f"Groq auxiliar respondeu ({len(content)} chars)")
                     track_api_call("Groq-compound", True)
                     return content
             return None
     except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", errors="ignore")
-        logger.warning(f"compound-beta falhou: HTTP {e.code}: {body[:100]}")
+        _handle_provider_http_error("Groq", e)
         track_api_call("Groq-compound", False)
         return None
     except Exception as e:
-        logger.warning(f"compound-beta erro: {e}")
+        logger.warning("Groq compatibilidade legada erro (%s)", _safe_exception_summary(e))
         return None
 
 def handle_text(chat_id, text):
@@ -1262,7 +1359,7 @@ def handle_voice(chat_id, voice_or_audio):
         else:
             send_message(chat_id, FALLBACK_MESSAGE)
     except Exception as e:
-        logger.error(f"Erro áudio: {e}", exc_info=True)
+        logger.error("Erro ao processar áudio (%s)", _safe_exception_summary(e))
         send_message(chat_id, "Desculpe, erro ao processar o áudio.")
 
 def handle_photo(chat_id, photo_list, caption=""):
@@ -1312,17 +1409,22 @@ def handle_photo(chat_id, photo_list, caption=""):
             context = "\n".join([f"{'Usuário' if m['role']=='user' else 'Bot'}: {m['content'][:150]}" for m in last_msgs])
             analysis_prompt += f"\n\nContexto da conversa anterior:\n{context}"
         
-        # Tentar Groq Vision primeiro (gratuito e rápido)
+        # Priorizar Gemini, que usa o mesmo modelo multimodal ativo de texto e visão.
         reply = None
-        if GROQ_API_KEY:
+        for i, key in enumerate(GEMINI_KEYS):
+            provider_cache_key = f"gemini_{i+1}"
+            if not is_api_available(provider_cache_key):
+                continue
+            reply = _call_gemini_vision(image_data, mime_type, analysis_prompt, key)
+            if reply:
+                break
+            mark_api_failed(provider_cache_key)
+
+        # Fallback opcional: Groq Vision, se o modelo estiver habilitado na conta.
+        if not reply and GROQ_API_KEY and is_api_available("groq_vision"):
             reply = _call_groq_vision(image_data, mime_type, analysis_prompt)
-        
-        # Fallback: Gemini Vision
-        if not reply:
-            for key in GEMINI_KEYS:
-                reply = _call_gemini_vision(image_data, mime_type, analysis_prompt, key)
-                if reply:
-                    break
+            if not reply:
+                mark_api_failed("groq_vision")
         
         # Fallback final: pedir descrição por texto
         if not reply:
@@ -1348,15 +1450,13 @@ def handle_photo(chat_id, photo_list, caption=""):
             pass
             
     except Exception as e:
-        logger.error(f"Erro foto: {e}", exc_info=True)
+        logger.error("Erro ao processar imagem (%s)", _safe_exception_summary(e))
         send_message(chat_id, "❌ Erro ao processar a imagem. Tente descrever o problema por texto.")
 
 def _call_groq_vision(image_data, mime_type, prompt):
-    """Chama Groq com modelo de visão (Llama 3.2 Vision) para análise de imagem"""
+    """Chama o modelo de visão Groq configurado, se disponível para a conta."""
     try:
-        # Modelo de visão do Groq
-        vision_model = "meta-llama/llama-4-scout-17b-16e-instruct"
-        
+        vision_model = GROQ_VISION_MODEL
         url = f"{GROQ_BASE_URL}/chat/completions"
         payload = json.dumps({
             "model": vision_model,
@@ -1396,21 +1496,27 @@ def _call_groq_vision(image_data, mime_type, prompt):
                     return text
         return None
     except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", errors="ignore")
-        logger.warning(f"Groq Vision falhou: HTTP {e.code}: {body[:150]}")
+        body = _read_http_error_body(e)
+        summary = _classify_provider_error(e.code, body)
+        logger.warning("Groq Vision (%s) falhou: %s", GROQ_VISION_MODEL, summary)
+        notify_admin_error("Groq Vision", summary)
         track_api_call("Groq-Vision", False)
-        # Tentar modelo alternativo
-        if "not found" in body.lower() or "not supported" in body.lower():
+        if GROQ_VISION_MODEL_FALLBACK and _is_model_not_found(e.code, body):
             return _call_groq_vision_fallback(image_data, mime_type, prompt)
         return None
     except Exception as e:
-        logger.warning(f"Groq Vision erro: {e}")
+        summary = _safe_exception_summary(e)
+        logger.warning("Groq Vision erro de conexão/processamento (%s)", summary)
+        notify_admin_error("Groq Vision", summary)
+        track_api_call("Groq-Vision", False)
         return None
 
 def _call_groq_vision_fallback(image_data, mime_type, prompt):
-    """Fallback: tenta llama-3.2-11b-vision-preview"""
+    """Fallback opcional configurado explicitamente pelo operador."""
+    if not GROQ_VISION_MODEL_FALLBACK:
+        return None
     try:
-        vision_model = "llama-3.2-11b-vision-preview"
+        vision_model = GROQ_VISION_MODEL_FALLBACK
         url = f"{GROQ_BASE_URL}/chat/completions"
         payload = json.dumps({
             "model": vision_model,
@@ -1449,14 +1555,19 @@ def _call_groq_vision_fallback(image_data, mime_type, prompt):
                     track_api_call("Groq-Vision-FB", True)
                     return text
         return None
+    except urllib.error.HTTPError as e:
+        _handle_provider_http_error("Groq Vision fallback", e)
+        track_api_call("Groq-Vision-FB", False)
+        return None
     except Exception as e:
-        logger.warning(f"Groq Vision fallback erro: {e}")
+        logger.warning("Groq Vision fallback erro (%s)", _safe_exception_summary(e))
+        track_api_call("Groq-Vision-FB", False)
         return None
 
 def _call_gemini_vision(image_data, mime_type, prompt, api_key):
     """Chama Gemini com imagem para análise visual"""
     try:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={api_key}"
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
         payload = json.dumps({
             "contents": [{
                 "parts": [
@@ -1468,6 +1579,7 @@ def _call_gemini_vision(image_data, mime_type, prompt, api_key):
         }).encode("utf-8")
         req = urllib.request.Request(url, data=payload, headers={
             "Content-Type": "application/json",
+            "x-goog-api-key": api_key,
             "User-Agent": USER_AGENT,
         })
         with urllib.request.urlopen(req, timeout=30) as resp:
@@ -1483,12 +1595,14 @@ def _call_gemini_vision(image_data, mime_type, prompt, api_key):
                         return text
         return None
     except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", errors="ignore")
-        logger.warning(f"Gemini Vision falhou: HTTP {e.code}: {body[:100]}")
+        _handle_provider_http_error("Gemini Vision", e)
         track_api_call("Gemini-Vision", False)
         return None
     except Exception as e:
-        logger.warning(f"Gemini Vision erro: {e}")
+        summary = _safe_exception_summary(e)
+        logger.warning("Gemini Vision erro de conexão/processamento (%s)", summary)
+        notify_admin_error("Gemini Vision", summary)
+        track_api_call("Gemini-Vision", False)
         return None
 
 def handle_document(chat_id, document):
@@ -1525,7 +1639,7 @@ def handle_document(chat_id, document):
         else:
             send_message(chat_id, "❌ Não foi possível extrair texto do arquivo.")
     except Exception as e:
-        logger.error(f"Erro doc: {e}", exc_info=True)
+        logger.error("Erro ao processar documento (%s)", _safe_exception_summary(e))
         send_message(chat_id, "❌ Erro técnico ao processar documento.")
 
 # --- Processar Update ---
@@ -1565,8 +1679,9 @@ def process_update(update):
         elif text:
             handle_text(chat_id, text)
     except Exception as e:
-        logger.error(f"Erro update: {e}", exc_info=True)
-        track_error(str(e))
+        summary = _safe_exception_summary(e)
+        logger.error("Erro ao processar update (%s)", summary)
+        track_error(summary)
 
 # --- Webhook HTTP Server ---
 def check_admin_auth(handler):
